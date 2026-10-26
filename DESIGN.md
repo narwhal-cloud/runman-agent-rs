@@ -52,7 +52,11 @@ rfw (独立进程, 127.0.0.1:7734)   eBPF/XDP 防火墙，由 agent 安装与反
   - `nproc` 仍显示宿主机核数：它读的是调度亲和性，只有把实例绑定到具体 CPU 核（cpuset）才能改变，目前没做。
   - 重启 lxcfs 会让运行中的实例失去这些视图，直到实例重启。安装器只在 lxcfs 参数变化时才重启它。
 
-**实例内存占用**：首次启动前会屏蔽对小内存实例不划算的服务，包括 exim4、systemd-resolved（改为写静态的 `/etc/resolv.conf`）、console-getty、timesyncd，以及 apt-daily、man-db、e2scrub、fstrim 等定时任务。定时任务平时不占内存，但 apt 更新一次就要几十 MB，足以让 128MB 的实例触发 OOM。另外把 journald 在 `/run` 里的日志限制在 8MB：`/run` 是 tmpfs，会计入实例内存。用户需要的话可以自行 `systemctl unmask`。实测 Debian 13 实例启动后的 cgroup 内存从 35MB 降到 12MB；Alpine 约 2MB。
+**实例内存占用**：首次启动前会屏蔽对小内存实例不划算的服务，包括 exim4、systemd-resolved（改为写静态的 `/etc/resolv.conf`）、console-getty、timesyncd，以及 apt-daily、man-db、e2scrub、fstrim 等定时任务。定时任务平时不占内存，但 apt 更新一次就要几十 MB，足以让 128MB 的实例触发 OOM。另外把 journald 在 `/run` 里的日志限制在 8MB：`/run` 是 tmpfs，会计入实例内存。用户需要的话可以自行 `systemctl unmask`。logind 和 dbus 也会被屏蔽：Debian 的 PAM 里 `pam_systemd` 是可选模块，SSH 登录照常可用；root 执行 `systemctl` 走 systemd 自己的私有 socket，不依赖 dbus。代价是 `hostnamectl`、`timedatectl`、`loginctl` 不能用。
+
+网络改由开机执行一次的 `runman-network` 服务配置（`/usr/local/sbin/runman-network` 脚本，用 `ip` 命令设置地址和路由），不再常驻 networkd。独立 IP 变化时改写脚本并重新执行；在此之前创建的实例继续走 networkd 的更新路径。
+
+实测 Debian 13 实例启动后的 cgroup 内存从 35MB 降到 8MB，常驻的只剩 sshd、journald 和 cron；Alpine 约 2MB。
 
 **宿主机内核参数**（由安装器写入 `/etc/sysctl.d/90-runman.conf`）：inotify、keys、pid_max、max_map_count、邻居表上限，以及 BBR。实测证实，inotify 实例上限是所有实例共用宿主机同一个用户的份额：宿主机总用量 86 时把上限设为 60，任何实例都无法再新建 inotify（EMFILE）。默认的 128 大约在开到第 14 个 Debian 实例时就会耗尽，届时所有实例里的服务都会开始启动失败。agent 启动时如果发现上限低于 8192，会记录警告。
 

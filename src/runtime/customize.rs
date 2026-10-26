@@ -29,6 +29,17 @@ const MEMORY_HEAVY_UNITS: &[&str] = &[
     "exim4.service",
     "exim4-base.timer",
     "systemd-resolved.service",
+    // logind and dbus (1.6 MB): SSH logins keep working (pam_systemd is
+    // optional) and root's systemctl uses systemd's private socket; only the
+    // *ctl tools of hostnamed/timedated/logind stop working.
+    "systemd-logind.service",
+    "dbus.service",
+    "dbus.socket",
+    // The network is set up once by runman-network (no resident daemon).
+    "systemd-networkd.service",
+    "systemd-networkd.socket",
+    "systemd-networkd-wait-online.service",
+    "systemd-networkd-persistent-storage.service",
     "apt-daily.timer",
     "apt-daily-upgrade.timer",
     "man-db.timer",
@@ -121,15 +132,72 @@ pub fn prepare(root: &RootFs, cfg: &FirstBoot<'_>) -> Result<()> {
 }
 
 const NETWORKD_FILE: &str = "/etc/systemd/network/05-runman-eth0.network";
+const NET_SCRIPT: &str = "/usr/local/sbin/runman-network";
+const NET_UNIT_PATH: &str = "/etc/systemd/system/runman-network.service";
+const NET_UNIT: &str = "[Unit]
+Description=Instance network (static, managed by runman)
+DefaultDependencies=no
+After=local-fs.target
+Before=network.target network-online.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/runman-network
+
+[Install]
+WantedBy=multi-user.target network-online.target
+";
+
+/// Shell script that configures eth0 statically; idempotent, re-run to
+/// apply changed dedicated addresses.
+fn net_script(n: &NetFiles) -> String {
+    let (x4, x6) = split_extra(n);
+    let mut f = String::from(
+        "#!/bin/sh\n# Written by runman: static instance network. Re-run to apply changes.\nset -e\n\
+         ip link set lo up\nip link set eth0 up\nip -4 addr flush dev eth0\nip -6 addr flush dev eth0 scope global\n",
+    );
+    f.push_str(&format!("ip addr add {}/{} dev eth0\n", n.ipv4, n.prefix4));
+    for a in &x4 {
+        f.push_str(&format!("ip addr add {a}/32 dev eth0\n"));
+    }
+    let src4 = x4.first().map(|a| format!(" src {a}")).unwrap_or_default();
+    f.push_str(&format!(
+        "ip route replace default via {} dev eth0{src4}\n",
+        n.gateway4
+    ));
+    let v6: Vec<_> = n.ipv6.iter().chain(&x6).collect();
+    if !v6.is_empty() {
+        f.push_str("sysctl -qw net.ipv6.conf.eth0.accept_ra=0 2>/dev/null || true\n");
+        for a in &v6 {
+            f.push_str(&format!("ip -6 addr add {a}/128 dev eth0 nodad\n"));
+        }
+        let src6 = x6.first().map(|a| format!(" src {a}")).unwrap_or_default();
+        f.push_str(&format!(
+            "ip -6 route replace default via {} dev eth0 onlink{src6}\n",
+            n.gateway6
+        ));
+    }
+    f
+}
 
 /// systemd-networkd when the image uses it, ifupdown otherwise (Alpine).
 pub fn write_network(root: &RootFs, n: &NetFiles) -> Result<()> {
-    if root.exists("/usr/lib/systemd/systemd-networkd")
-        || root.exists("/lib/systemd/systemd-networkd")
-    {
-        root.mkdir_all("/etc/systemd/network")?;
-        // Sorts before the image's DHCP config; networkd uses the first match.
-        root.write(NETWORKD_FILE, networkd_file(n).as_bytes(), 0o644)?;
+    if root.exists("/etc/systemd/system") {
+        // A oneshot unit applies a static configuration with `ip` and exits:
+        // no network daemon stays resident (networkd costs ~1.4 MB).
+        root.mkdir_all("/usr/local/sbin")?;
+        root.write(NET_SCRIPT, net_script(n).as_bytes(), 0o755)?;
+        root.write(NET_UNIT_PATH, NET_UNIT.as_bytes(), 0o644)?;
+        for target in ["multi-user.target.wants", "network-online.target.wants"] {
+            root.mkdir_all(&format!("/etc/systemd/system/{target}"))?;
+            root.symlink(
+                &format!("/etc/systemd/system/{target}/runman-network.service"),
+                NET_UNIT_PATH,
+            )?;
+        }
+        root.remove(NETWORKD_FILE)?;
         root.remove("/etc/systemd/network/10-cloud-init-eth0.network")?;
         // systemd-resolved is masked to save memory: point resolv.conf at
         // the DNS servers directly (replaces the stub-resolver symlink).
@@ -151,7 +219,12 @@ pub fn write_network(root: &RootFs, n: &NetFiles) -> Result<()> {
 pub fn network_update_script(n: &NetFiles) -> String {
     format!(
         "set -e\n\
-         if [ -x /usr/lib/systemd/systemd-networkd ] || [ -x /lib/systemd/systemd-networkd ]; then\n\
+         if [ -x {NET_SCRIPT} ]; then\n\
+         cat > {NET_SCRIPT}.tmp <<'RUNMAN_EOF'\n{}RUNMAN_EOF\n\
+         chmod 755 {NET_SCRIPT}.tmp\n\
+         mv {NET_SCRIPT}.tmp {NET_SCRIPT}\n\
+         {NET_SCRIPT}\n\
+         elif [ -x /usr/lib/systemd/systemd-networkd ] || [ -x /lib/systemd/systemd-networkd ]; then\n\
          mkdir -p /etc/systemd/network\n\
          cat > {NETWORKD_FILE}.tmp <<'RUNMAN_EOF'\n{}RUNMAN_EOF\n\
          mv {NETWORKD_FILE}.tmp {NETWORKD_FILE}\n\
@@ -163,6 +236,7 @@ pub fn network_update_script(n: &NetFiles) -> String {
          ifdown -f eth0 >/dev/null 2>&1 || true\n\
          ifup eth0\n\
          fi\n",
+        net_script(n),
         networkd_file(n),
         interfaces_file(n)
     )
