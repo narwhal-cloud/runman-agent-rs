@@ -1,0 +1,35 @@
+# /etc/runman-agent/config.toml — every key is optional; shown with defaults.
+# The installer writes the essentials. Restart the agent after editing
+# (`systemctl restart runman-agent`); instances keep running.
+
+platform_url = "https://hosting.fuckip.me:443"
+token = ""                  # integration token; set with `runman-agent set-token`
+host = ""                   # entry address in heartbeats; empty = detected public IPv4
+virt_label = "container"    # shown by the platform as the virtualization type
+data_dir = "/var/lib/runman-agent"
+backend = "container"       # "fake" = in-memory, for development only
+image_base_url = "https://github.com/narwhal-cloud/images/releases/download/vm-latest"
+tun = true                  # expose /dev/net/tun to instances
+traffic_reset_day = 1       # day of month (1-28) monthly traffic starts again
+bandwidth_mbps = 0          # uplink bandwidth reported to the platform
+
+web_listen = "0.0.0.0:8792" # management panel; "" disables, 127.0.0.1:8792 = SSH tunnel only
+web_user = "admin"
+web_password_hash = ""      # set with `runman-agent set-password`
+rfw_addr = "127.0.0.1:7734"
+
+update_url = "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous"
+auto_update = true
+
+[network]
+bridge = "rmbr0"
+ipv4_subnet = "10.91.0.0/20"
+ipv6_mode = "none"          # none | snat | subnet  (`runman-agent detect-ipv6` suggests one)
+ipv6_prefix = ""            # subnet: prefix instances get addresses from
+ipv6_ndp_uplink = ""        # subnet: uplink where the prefix is on-link (empty = routed)
+dns = ["1.1.1.1", "8.8.8.8"]
+# Host-side names; change only to run several agents on one host (tests).
+veth_prefix = "rv"
+wg_prefix = "rw"
+wg_table_base = 20000
+nft_table = "runman"

@@ -1,0 +1,108 @@
+# Builds static binaries and publishes them with a signed checksum list.
+#
+# - push to main  -> pre-release "continuous" (what nodes follow by default)
+# - tag v*        -> release with that tag
+#
+# Repository configuration (see README "Releases and self-update"):
+# - variable UPDATE_PUBKEY:      base64 of the raw 32-byte ed25519 public key,
+#                                compiled into the binaries
+# - secret   UPDATE_SIGNING_KEY: the matching private key (PEM)
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cargo-zigbuild
+        run: pip3 install --break-system-packages ziglang cargo-zigbuild
+      - name: Check signing key variable
+        env:
+          UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
+        run: |
+          if [ -z "$UPDATE_PUBKEY" ]; then
+            echo "::error::repository variable UPDATE_PUBKEY is not set; released binaries could not verify updates"
+            exit 1
+          fi
+      - name: Build
+        env:
+          RUNMAN_UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
+          RUNMAN_BUILD_ID: ${{ github.ref_type == 'tag' && github.ref_name || format('g{0}', github.sha) }}
+        run: |
+          RUNMAN_BUILD_ID="${RUNMAN_BUILD_ID:0:12}"
+          export RUNMAN_BUILD_ID
+          cargo zigbuild --release --locked --target ${{ matrix.target }} --bin runman-agent
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/runman-agent dist/runman-agent-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runman-agent-linux-${{ matrix.arch }}
+          path: dist/runman-agent-linux-${{ matrix.arch }}
+          retention-days: 3
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and signature
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
+        run: |
+          cp install.sh dist/
+          cd dist
+          chmod 755 runman-agent-linux-*
+          sha256sum runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh > SHA256SUMS
+          umask 077
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/key.pem" -rawin -in SHA256SUMS -out SHA256SUMS.sig
+          rm -f "$RUNNER_TEMP/key.pem"
+          # The published signature must verify against the compiled-in key
+          # (raw ed25519 key wrapped into a DER SubjectPublicKeyInfo).
+          { printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00'; printf '%s' "$UPDATE_PUBKEY" | base64 -d; } > "$RUNNER_TEMP/pub.der"
+          openssl pkeyutl -verify -pubin -keyform DER -inkey "$RUNNER_TEMP/pub.der" -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
+          ls -l
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          files=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh SHA256SUMS SHA256SUMS.sig)
+          if [ "${{ github.ref_type }}" = tag ]; then
+            gh release create "${{ github.ref_name }}" "${files[@]}" --title "${{ github.ref_name }}" --generate-notes
+          else
+            gh release delete continuous --yes --cleanup-tag 2>/dev/null || true
+            gh release create continuous "${files[@]}" --prerelease --target "${{ github.sha }}" \
+              --title "Continuous build" --notes "Latest main: ${{ github.sha }}"
+          fi

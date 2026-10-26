@@ -1,0 +1,57 @@
+[package]
+name = "runman-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Runman node agent: system-container runtime managed by the Narwhal Cloud platform"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "runman-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.22.1"
+bcrypt = "0.19.3"
+ed25519-dalek = "2.2.0"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+async-trait = "0.1.88"
+clap = { version = "4.6.1", features = ["derive"] }
+libc = "0.2.186"
+nix = { version = "0.31.3", features = ["fs", "hostname", "ioctl", "mount", "poll", "process", "sched", "signal", "term", "user"] }
+sha-crypt = { version = "0.5.0", features = ["simple"] }
+sha2 = "0.10.9"
+prost = "0.14.4"
+rand = "0.9.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.52.1", features = ["full"] }
+tokio-stream = "0.1.17"
+tokio-util = "0.7.15"
+toml = "0.9.8"
+tonic = { version = "0.14.6", default-features = false, features = ["channel", "codegen", "server", "router", "tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+uuid = { version = "1.18.1", features = ["v4"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "cookies"] }
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
+
+[build-dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.6"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

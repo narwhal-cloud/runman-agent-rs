@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests (protocol, panel, unit)
+        run: cargo test
+      - name: Installer
+        run: |
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S style install.sh
+          bash install.sh --help >/dev/null
+
+  # Real containers on the runner VM: needs root, systemd and network.
+  integration:
+    runs-on: ubuntu-24.04
+    # Not verified on GitHub-hosted runners yet; keep it informative until it
+    # has passed there a few times.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Host packages
+        run: sudo apt-get install -y -qq nftables wireguard-tools e2fsprogs
+      - name: Build tests
+        run: cargo test --release --test runtime_linux --no-run
+      - name: Runtime integration tests
+        run: >-
+          sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup"
+          cargo test --release --test runtime_linux -- --ignored --test-threads=1
+          instance_lifecycle ipv6_snat_mode
