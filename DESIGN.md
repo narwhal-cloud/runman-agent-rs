@@ -54,6 +54,8 @@ rfw (独立进程, 127.0.0.1:7734)   eBPF/XDP 防火墙，由 agent 安装与反
 
 **宿主机内核参数**（由安装器写入 `/etc/sysctl.d/90-runman.conf`）：inotify、keys、pid_max、max_map_count、邻居表上限，以及 BBR。实测证实，inotify 实例上限是所有实例共用宿主机同一个用户的份额：宿主机总用量 86 时把上限设为 60，任何实例都无法再新建 inotify（EMFILE）。默认的 128 大约在开到第 14 个 Debian 实例时就会耗尽，届时所有实例里的服务都会开始启动失败。agent 启动时如果发现上限低于 8192，会记录警告。
 
+**宿主机重启**（已在测试机上实测）：agent、rfw、lxcfs 开机自启；agent 按实例记录的期望状态重新拉起实例，并重建网桥、nftables 规则和端口转发。实例磁盘上的数据保留，IP 不变，lxcfs 视图和 seccomp 生效，流量计数在原累计值上继续增加（veth 接口编号变了，不会被当成计数器归零）。
+
 **TUN 支持**：默认对每个实例开放 `/dev/net/tun`（cgroup 放行 `c 10:200 rwm`，并 bind mount 设备节点）。容器 root 在自己的 user namespace / network namespace 内拥有 CAP_NET_ADMIN，可以直接运行 WireGuard-go、OpenVPN、tailscale、sing-box TUN 模式，影响不到宿主机。按实例可关闭。
 
 **资源**：cgroup v2 `cpu.max`（核数 × 100000/100000）、`memory.max` + `memory.swap.max`、`pids.max`、`io.max`。
