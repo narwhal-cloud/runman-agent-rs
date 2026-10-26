@@ -12,7 +12,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -36,7 +36,7 @@ jobs:
     # has passed there a few times.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Host packages and limits (as install.sh sets them)
@@ -51,7 +51,16 @@ jobs:
       - name: Build tests
         run: cargo test --release --test runtime_linux --no-run
       - name: Runtime integration tests
-        run: >-
-          sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup"
-          cargo test --release --test runtime_linux -- --ignored --test-threads=1
-          instance_lifecycle ipv6_snat_mode
+        run: |
+          set -o pipefail
+          sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" \
+            cargo test --release --test runtime_linux -- --ignored --test-threads=1 \
+            instance_lifecycle ipv6_snat_mode concurrent_creates_get_distinct_slots 2>&1 | tee test.log
+      - name: Report integration failure
+        if: failure()
+        run: |
+          # Surface the failing assertion as annotations (readable without log access).
+          grep -A6 -E "panicked at|^Caused by" test.log | head -40 | while IFS= read -r line; do
+            echo "::error title=runtime_linux::$line"
+          done
+          sudo journalctl -u 'runman-*' --no-pager -n 30 | while IFS= read -r line; do echo "::warning title=journal::$line"; done
