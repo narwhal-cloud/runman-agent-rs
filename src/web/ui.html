@@ -140,7 +140,7 @@ function bandwidthCard(b) {
       <button class="btn primary">保存</button>
       <button class="btn" type="button" id="speedtest-run"${t.running ? ' disabled' : ''}>${t.running ? '测速中…' : '重新测速'}</button>
     </form>
-    <p class="muted">平台用这个带宽限制此节点上可售套餐的带宽上限。节点每周自动向 Cloudflare 测速一次（8 路并发，每个方向两轮取较好的一轮，最多约 800 MB 流量），取上下行中较小的值。
+    <p class="muted">平台用这个带宽限制此节点上可售套餐的带宽上限。节点首次启动时自动向 Cloudflare 测速一次，之后只在点「重新测速」时再测（8 路并发，每个方向两轮取较好的一轮，最多约 800 MB 流量），取上下行中较小的值。
       测速受线路和距离影响可能偏低，可以手动修正：可以填任意更低的值，最高为测速结果的 2 倍${b.max ? `（当前最高 ${b.max} Mbps）` : ''}。</p>`;
 }
 

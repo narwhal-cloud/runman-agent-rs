@@ -4,8 +4,8 @@
 //! Downloads from and uploads to Cloudflare's speed test endpoints over
 //! several parallel connections with `curl` (one TCP stream underestimates
 //! fast links), best of two rounds, and reports the slower direction: instance bandwidth limits
-//! apply both ways. The result is kept in `<data>/speedtest.json` and
-//! refreshed weekly, so agent restarts and updates do not re-test.
+//! apply both ways. The first start measures once and keeps the result in
+//! `<data>/speedtest.json`; later tests only run on request.
 //!
 //! A test is approximate (distance to Cloudflare, congestion), so the owner
 //! may correct it with `bandwidth_mbps`: anything below the measurement, or
@@ -30,8 +30,8 @@ const STREAMS: usize = 8;
 const STREAM_BYTES: u64 = 50_000_000;
 const STREAM_TIMEOUT: Duration = Duration::from_secs(15);
 const ROUNDS: usize = 2;
-/// Re-test after this long.
-pub const MAX_AGE: Duration = Duration::from_secs(7 * 86_400);
+/// Wait before retrying a failed first test.
+const RETRY: Duration = Duration::from_secs(6 * 3600);
 /// An owner may report at most this many times the measured bandwidth.
 pub const MAX_CORRECTION: u32 = 2;
 
@@ -112,15 +112,6 @@ impl SpeedTest {
         }
     }
 
-    fn stale(&self) -> bool {
-        let age = self
-            .last
-            .lock()
-            .unwrap()
-            .map(|m| unix_now().saturating_sub(m.at));
-        age.is_none_or(|a| a >= MAX_AGE.as_secs())
-    }
-
     /// Run a test unless one is already running.
     pub async fn run(&self) -> Result<Measurement> {
         if self.running.swap(true, Ordering::SeqCst) {
@@ -151,16 +142,18 @@ impl SpeedTest {
         result
     }
 
-    /// Test shortly after start when the last result is old, then weekly.
+    /// Test once, shortly after the first start; retry until it succeeds.
+    /// Afterwards only manual tests (panel, `runman-agent speedtest`) run.
     pub async fn schedule(&self, shutdown: tokio_util::sync::CancellationToken) {
         let mut wait = Duration::from_secs(60);
-        loop {
+        while self.last.lock().unwrap().is_none() {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = tokio::time::sleep(wait) => {}
             }
-            wait = Duration::from_secs(6 * 3600);
-            if self.stale() {
+            wait = RETRY;
+            // A manual test may have finished meanwhile.
+            if self.last.lock().unwrap().is_none() {
                 let _ = self.run().await;
             }
         }

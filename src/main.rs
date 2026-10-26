@@ -47,8 +47,8 @@ enum Command {
     },
     /// Probe the host and print suggested IPv6 settings for `[network]`.
     DetectIpv6,
-    /// Measure the uplink bandwidth now and save it (the agent also tests
-    /// weekly; restart it to report a result measured here).
+    /// Measure the uplink bandwidth now and save it (restart the agent to
+    /// report a result measured here).
     Speedtest,
 }
 
