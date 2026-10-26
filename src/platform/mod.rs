@@ -203,9 +203,12 @@ impl Agent {
         while !shutdown.is_cancelled() {
             let cfg = self.cfg.get();
             if cfg.token.is_empty() {
-                self.set_status(false, "no token configured".into());
-                if sleep_or_cancel(Duration::from_secs(10), &shutdown).await {
-                    return;
+                // Standalone: never contact the platform without a token.
+                self.set_status(false, "standalone mode (no platform token)".into());
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    _ = self.reconnect.notified() => {}
                 }
                 continue;
             }

@@ -9,6 +9,7 @@ pub mod backend;
 pub mod config;
 pub mod detect;
 pub mod fake;
+pub mod local_wg;
 #[cfg(target_os = "linux")]
 pub mod metrics;
 pub mod model;

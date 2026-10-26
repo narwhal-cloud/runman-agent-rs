@@ -2,6 +2,13 @@
 
 Runman 节点 agent（Rust 重写版）。它在宿主机上直接运行系统容器（完整的 Debian / Alpine，带 systemd 或 OpenRC 与 sshd），通过 `proto/agent.proto` 的 gRPC 长连接接受 Narwhal Cloud 平台的管理。协议与原 Go 版 agent 完全兼容，平台无需任何改动。
 
+两种运行模式：
+
+- **独立模式**（没有平台 Token，默认）：不连接平台，作为独立的切鸡服务使用。实例的开通、删除、重装、端口转发、WireGuard 独立 IP 都在节点自带的面板里管理。
+- **平台模式**（设置了平台下发的 Token）：由 Narwhal Cloud 平台管理，面板只做查看和日常运维。
+
+Token 只由平台生成，agent 和安装器从不自行生成。
+
 只面向**全新安装**的节点，不接管旧版 agent 的 Podman / Incus / cloud-hypervisor 实例。设计与实测结论见 [DESIGN.md](DESIGN.md)。
 
 ## 功能
@@ -19,14 +26,15 @@ Runman 节点 agent（Rust 重写版）。它在宿主机上直接运行系统�
 
 ```bash
 curl -fsSL https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous/install.sh -o install.sh
-bash install.sh --token '<对接 Token>'
+bash install.sh                                  # 独立模式
+bash install.sh --token '<平台下发的 Token>'      # 接入平台
 ```
 
-安装完成后会打印面板地址、登录密码和 Token（只在首次安装时打印）。常用参数：
+安装完成后会打印面板地址和登录密码（只在首次安装时打印）。常用参数：
 
 | 参数 | 说明 |
 |---|---|
-| `--token TOKEN` | 对接 Token；省略则生成一个 |
+| `--token TOKEN` | 平台下发的 Token；省略则以独立模式运行 |
 | `--web-listen 127.0.0.1:8792` | 面板只监听本机，通过 `ssh -L` 访问（推荐公网节点使用） |
 | `--ipv6 auto\|none\|snat\|subnet` | 默认 `auto`：实测整段 /64 能否作为源地址后选择 `subnet`，否则 `snat` 或 `none` |
 | `--ipv6-prefix CIDR --ipv6-uplink IFACE` | 手工指定 `subnet` 前缀 |
@@ -35,7 +43,8 @@ bash install.sh --token '<对接 Token>'
 
 - **升级**：重新运行 `install.sh` 即可，配置保持不变；默认也会自动更新。
 - **卸载**：`bash install.sh --uninstall`（节点上还有实例时拒绝执行）；`--uninstall --purge` 会连同全部实例和数据一起删除。
-- **忘记面板密码**：`echo '新密码' | runman-agent set-password`；轮换 Token：`runman-agent set-token`（或在面板里操作）。
+- **忘记面板密码**：`echo '新密码' | runman-agent set-password`。
+- **接入或断开平台**：`runman-agent set-token '<Token>'` / `runman-agent set-token --clear`，然后执行 `systemctl restart runman-agent`；也可以在面板「设置」里操作（立即生效）。节点上已有本地实例时接入平台要谨慎：平台会删除它数据库里没有的实例。
 
 配置文件为 `/etc/runman-agent/config.toml`，全部配置项见 [config.example.toml](config.example.toml)。
 

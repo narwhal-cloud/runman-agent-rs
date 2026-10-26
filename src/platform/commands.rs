@@ -116,14 +116,14 @@ impl CommandRunner {
                 let spec = InstanceSpec::from_create(&c)?;
                 let _g = self.lock_vm(&spec.vm_id).await;
                 s.instances.create(&spec).await?;
-                self.ensure_ssh_forward(&spec.vm_id).await;
+                crate::backend::ensure_ssh_forward(s.port_forwards.as_ref(), &spec.vm_id).await;
                 Ok(())
             }
             Some(Down::ReinstallVm(c)) => {
                 let spec = InstanceSpec::from_reinstall(&c)?;
                 let _g = self.lock_vm(&spec.vm_id).await;
                 s.instances.reinstall(&spec).await?;
-                self.ensure_ssh_forward(&spec.vm_id).await;
+                crate::backend::ensure_ssh_forward(s.port_forwards.as_ref(), &spec.vm_id).await;
                 Ok(())
             }
             Some(Down::StartVm(c)) => {
@@ -180,49 +180,6 @@ impl CommandRunner {
         let id = VmId::parse(vm_id)?;
         let rules = self.services.port_forwards.list(Some(&id)).await?;
         Ok(rules.iter().map(PortForward::to_proto).collect())
-    }
-
-    /// Every instance gets a random host port forwarded to SSH (22/tcp), like
-    /// the Go agent. Failure is logged, not fatal: the instance itself exists.
-    async fn ensure_ssh_forward(&self, id: &VmId) {
-        let pf = &self.services.port_forwards;
-        match pf.list(Some(id)).await {
-            Ok(rules)
-                if rules
-                    .iter()
-                    .any(|r| r.proto == L4Proto::Tcp && r.guest_port == 22) =>
-            {
-                return;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!("ssh forward for {id}: list rules: {e:#}");
-                return;
-            }
-        }
-        for _ in 0..5 {
-            let host_port = match pf.free_port().await {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("ssh forward for {id}: {e:#}");
-                    return;
-                }
-            };
-            let rule = PortForward {
-                vm_id: id.clone(),
-                proto: L4Proto::Tcp,
-                host_port,
-                guest_port: 22,
-                description: "ssh".into(),
-            };
-            match pf.add(rule).await {
-                Ok(()) => {
-                    info!("ssh forward for {id}: {host_port} -> 22");
-                    return;
-                }
-                Err(e) => warn!("ssh forward for {id} on {host_port}: {e:#}"),
-            }
-        }
     }
 
     async fn lock_vm(&self, id: &VmId) -> tokio::sync::OwnedMutexGuard<()> {

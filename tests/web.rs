@@ -8,6 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use runman_agent::backend::Instances;
 use runman_agent::config::{Config, Store};
 use runman_agent::fake::Fake;
+use runman_agent::local_wg::LocalWg;
 use runman_agent::model::{InstanceSpec, VmId};
 use runman_agent::platform::{Agent, Timing};
 use runman_agent::web::Web;
@@ -45,18 +46,29 @@ async fn mock_rfw() -> std::net::SocketAddr {
     addr
 }
 
+/// Panel in platform mode (a token is set).
 async fn start() -> Panel {
+    start_with_token("old-token-0123456789").await
+}
+
+async fn start_with_token(token: &str) -> Panel {
     let rfw = mock_rfw().await;
     let cfg = Config {
         web_password_hash: bcrypt::hash(PASSWORD, 4).unwrap(),
-        token: "old-token-0123456789".into(),
+        token: token.into(),
         rfw_addr: rfw.to_string(),
         ..Config::default()
     };
     let store = Store::in_memory(cfg);
     let fake = Fake::new();
     let agent = Agent::new(store.clone(), fake.services(), Timing::default());
-    let web = Web::new(agent, fake.services(), None);
+    let local_wg = std::sync::Arc::new(
+        LocalWg::load(
+            &std::env::temp_dir().join(format!("runman-web-test-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap(),
+    );
+    let web = Web::new(agent, fake.services(), None, local_wg);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let shutdown = CancellationToken::new();
@@ -267,19 +279,16 @@ async fn settings_token_and_password() {
         "the full token must not be exposed"
     );
 
-    let r: Value = c
+    // Tokens come from the platform: the panel never makes one up.
+    let r = c
         .post(format!("{}/api/settings/token", p.base))
         .header("X-Runman", "1")
         .json(&json!({}))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    let token = r["token"].as_str().unwrap();
-    assert_eq!(token.len(), 48);
-    assert_eq!(p.store.get().token, token);
+    assert!(r.status().is_client_error());
+    assert_eq!(p.store.get().token, "old-token-0123456789");
 
     let r = c
         .put(format!("{}/api/settings", p.base))
@@ -420,4 +429,213 @@ async fn websocket_console() {
     .await
     .unwrap();
     ws.close(None).await.unwrap();
+}
+
+async fn post(c: &reqwest::Client, url: String, body: Value) -> reqwest::Response {
+    c.post(url)
+        .header("X-Runman", "1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn platform_mode_keeps_lifecycle_on_the_platform() {
+    let p = start().await;
+    let c = client();
+    login(&p, &c, PASSWORD).await;
+    let o: Value = c
+        .get(format!("{}/api/overview", p.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(o["mode"], "platform");
+    let r = post(
+        &c,
+        format!("{}/api/instances", p.base),
+        json!({"os_image": "debian", "cpu": 1, "ram_mb": 256, "disk_gb": 1}),
+    )
+    .await;
+    assert_eq!(r.status(), 409);
+    let r = c
+        .delete(format!("{}/api/instances/{VM}", p.base))
+        .header("X-Runman", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409);
+    let r = post(
+        &c,
+        format!("{}/api/instances/{VM}/forwards", p.base),
+        json!({"proto": "tcp", "guest_port": 80}),
+    )
+    .await;
+    assert_eq!(r.status(), 409);
+    assert_eq!(p.fake.instances.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn standalone_mode_manages_the_node() {
+    let p = start_with_token("").await;
+    let c = client();
+    login(&p, &c, PASSWORD).await;
+    let o: Value = c
+        .get(format!("{}/api/overview", p.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(o["mode"], "standalone");
+
+    // Create with a generated password and an automatic SSH forward.
+    let r: Value = post(
+        &c,
+        format!("{}/api/instances", p.base),
+        json!({"os_image": "alpine", "cpu": 2, "ram_mb": 1024, "disk_gb": 10, "bandwidth_mbps": 100}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let id = r["id"].as_str().unwrap().to_owned();
+    assert_eq!(r["root_password"].as_str().unwrap().len(), 16);
+    assert!(r["ssh_port"].as_u64().is_some());
+    let invalid = post(
+        &c,
+        format!("{}/api/instances", p.base),
+        json!({"os_image": "alpine", "cpu": 0, "ram_mb": 1, "disk_gb": 1}),
+    )
+    .await;
+    assert_eq!(invalid.status(), 400);
+
+    // Port forwards: automatic host port, then removal.
+    let r: Value = post(
+        &c,
+        format!("{}/api/instances/{id}/forwards", p.base),
+        json!({"proto": "udp", "guest_port": 51820}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let port = r["host_port"].as_u64().unwrap();
+    assert!(
+        p.fake
+            .rules
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.host_port as u64 == port && f.guest_port == 51820)
+    );
+    let r = c
+        .delete(format!("{}/api/instances/{id}/forwards/udp/{port}", p.base))
+        .header("X-Runman", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // Reinstall keeps the plan, changes the image.
+    let r: Value = post(
+        &c,
+        format!("{}/api/instances/{id}/reinstall", p.base),
+        json!({"os_image": "debian"}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert!(r["root_password"].is_string());
+    {
+        let instances = p.fake.instances.lock().unwrap();
+        let inst = instances
+            .values()
+            .find(|i| i.spec.vm_id.as_str() == id)
+            .unwrap();
+        assert_eq!(
+            (inst.spec.os_image.as_str(), inst.spec.cpu, inst.spec.ram_mb),
+            ("debian", 2, 1024)
+        );
+    }
+
+    // Dedicated IP from a wg-quick config, applied through WgBindings.
+    let conf = format!(
+        "[Interface]\nPrivateKey = {k}\nAddress = 203.0.113.9/32\n[Peer]\nPublicKey = {k}\nEndpoint = 192.0.2.1:51820\nAllowedIPs = 0.0.0.0/0\n",
+        k = format!("{}=", "A".repeat(43))
+    );
+    let r = post(
+        &c,
+        format!("{}/api/wg", p.base),
+        json!({"vm_id": id, "config": conf}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(p.fake.wg.lock().unwrap().len(), 1);
+    let listed: Value = c
+        .get(format!("{}/api/wg", p.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed.to_string().contains("203.0.113.9"));
+    assert!(
+        !listed.to_string().contains("AAAA"),
+        "keys must not be returned"
+    );
+
+    // Deleting the instance also drops its forwards and dedicated IPs.
+    let r = c
+        .delete(format!("{}/api/instances/{id}", p.base))
+        .header("X-Runman", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(p.fake.wg.lock().unwrap().is_empty());
+    assert!(
+        p.fake
+            .rules
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|f| f.vm_id.as_str() != id)
+    );
+
+    // Joining the platform with local instances needs an explicit confirm.
+    let r = post(
+        &c,
+        format!("{}/api/settings/token", p.base),
+        json!({"token": "platform-token-0123456789"}),
+    )
+    .await;
+    assert_eq!(r.status(), 409, "the fixture instance still exists locally");
+    assert_eq!(p.store.get().token, "");
+    let r = post(
+        &c,
+        format!("{}/api/settings/token", p.base),
+        json!({"token": "platform-token-0123456789", "confirm": true}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(p.store.get().token, "platform-token-0123456789");
+    let r = post(
+        &c,
+        format!("{}/api/settings/token", p.base),
+        json!({"token": ""}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        p.store.get().token,
+        "",
+        "clearing returns to standalone mode"
+    );
 }

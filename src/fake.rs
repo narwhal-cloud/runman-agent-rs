@@ -137,6 +137,25 @@ impl Instances for Fake {
         ])
     }
 
+    async fn details(&self) -> Result<Vec<crate::model::InstanceDetails>> {
+        let summaries = Instances::list(self).await?;
+        let map = self.instances.lock().unwrap();
+        Ok(summaries
+            .iter()
+            .map(|s| {
+                let mut d = crate::model::InstanceDetails::from_summary(s);
+                if let Some(i) = map.values().find(|i| i.spec.vm_id.as_str() == s.vm_id) {
+                    d.cpu = i.spec.cpu;
+                    d.ram_mb = i.spec.ram_mb;
+                    d.disk_gb = i.spec.disk_gb;
+                    d.bandwidth_mbps = i.spec.bandwidth_mbps;
+                    d.os_image = i.spec.os_image.clone();
+                }
+                d
+            })
+            .collect())
+    }
+
     /// Echo console: every input chunk is written back as output.
     async fn open_console(&self, id: &VmId, _size: Option<ConsoleSize>) -> Result<ConsoleIo> {
         self.with_instance(id, |_| ())?;

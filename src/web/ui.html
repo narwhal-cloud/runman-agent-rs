@@ -83,6 +83,7 @@ pre.log { max-height: 65vh; overflow: auto; background: var(--code); padding: 10
     <nav>
       <button data-tab="overview" class="active">概览</button>
       <button data-tab="instances">实例</button>
+      <button data-tab="wg">独立 IP</button>
       <button data-tab="firewall">防火墙</button>
       <button data-tab="settings">设置</button>
     </nav>
@@ -92,6 +93,7 @@ pre.log { max-height: 65vh; overflow: auto; background: var(--code); padding: 10
   <main>
     <section id="tab-overview"></section>
     <section id="tab-instances" class="hidden"></section>
+    <section id="tab-wg" class="hidden"></section>
     <section id="tab-firewall" class="hidden"></section>
     <section id="tab-settings" class="hidden"></section>
   </main>
@@ -109,6 +111,15 @@ const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 const bytes = n => { n = Number(n) || 0; const u = ['B','KB','MB','GB','TB']; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
 const rate = n => bytes(n) + '/s';
 let current = 'overview', timer = null;
+// Refreshed with every overview call: mode decides what the panel may change.
+const node = { mode: 'standalone', images: [], entry: '' };
+async function refreshNode() {
+  const o = await api('/api/overview');
+  node.mode = o.mode; node.images = o.images; node.entry = o.entry.host || o.entry.ipv4 || location.hostname;
+  return o;
+}
+const standalone = () => node.mode === 'standalone';
+const sshHint = port => port ? `ssh -p ${port} root@${node.entry}` : '（未分配 SSH 端口）';
 
 function toast(msg) {
   const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg;
@@ -123,7 +134,7 @@ async function api(path, opts = {}) {
   if (r.status === 401 && path !== '/api/login') { showLogin(); throw new Error('请先登录'); }
   const text = await r.text();
   let data; try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  if (!r.ok) throw new Error((data && data.error) || text || r.statusText);
+  if (!r.ok) { const e = new Error((data && data.error) || text || r.statusText); e.status = r.status; throw e; }
   return data;
 }
 
@@ -146,7 +157,7 @@ function switchTab(tab) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('main > section').forEach(s => s.classList.toggle('hidden', s.id !== 'tab-' + tab));
   clearInterval(timer);
-  const load = { overview: loadOverview, instances: loadInstances, firewall: loadFirewall, settings: loadSettings }[tab];
+  const load = { overview: loadOverview, instances: loadInstances, wg: loadWg, firewall: loadFirewall, settings: loadSettings }[tab];
   load();
   if (tab === 'overview' || tab === 'instances') timer = setInterval(load, 10000);
 }
@@ -155,16 +166,18 @@ function switchTab(tab) {
 async function loadOverview() {
   const el = $('#tab-overview');
   try {
-    const [o, rfw] = await Promise.all([api('/api/overview'), api('/api/rfw/status').catch(() => null)]);
+    const [o, rfw] = await Promise.all([refreshNode(), api('/api/rfw/status').catch(() => null)]);
     const h = o.host || {}, p = o.platform;
-    const plat = p.connected ? '<span class="badge ok">已连接</span>'
-      : `<span class="badge bad">未连接</span><div class="muted">${esc(p.token_set ? p.last_error : '未设置对接 Token')}</div>`;
+    const plat = o.mode === 'standalone'
+      ? '<span class="badge">独立模式</span><div class="muted">未设置平台 Token，节点完全由本面板管理</div>'
+      : p.connected ? '<span class="badge ok">已连接平台</span>'
+      : `<span class="badge bad">未连接</span><div class="muted">${esc(p.last_error)}</div>`;
     const fw = !rfw ? '<span class="badge warn">未知</span>'
       : rfw.service === 'active' ? `<span class="badge ok">运行中</span><div class="muted">${esc(rfw.api ? rfw.api.iface + ' · ' + rfw.api.rule_count + ' 条规则' : 'API 无响应')}</div>`
       : `<span class="badge warn">${esc(rfw.service || '未安装')}</span>`;
     el.innerHTML = `
       <div class="grid">
-        <div class="card"><h3>平台连接</h3>${plat}<div class="muted mono">${esc(p.url)}</div></div>
+        <div class="card"><h3>管理模式</h3>${plat}${o.mode === 'standalone' ? '' : `<div class="muted mono">${esc(p.url)}</div>`}</div>
         <div class="card"><h3>入口地址</h3><div class="mono">${esc(o.entry.host || o.entry.ipv4 || '-')}</div><div class="muted mono">${esc(o.entry.ipv6 || '')}</div></div>
         <div class="card"><h3>CPU</h3><div class="big">${(h.cpu_pct ?? 0).toFixed(1)}%</div><div class="muted">${h.cpus ?? '-'} 核 · 负载 ${(h.load || []).map(x => x.toFixed(2)).join(' ')}</div></div>
         <div class="card"><h3>内存</h3><div class="big">${h.ram_used_mb ?? '-'} / ${h.ram_total_mb ?? '-'} MB</div></div>
@@ -199,48 +212,154 @@ $('#tab-overview').addEventListener('click', async e => {
 });
 
 // ── instances ──
+function createForm() {
+  if (!node.images.length) return '<p class="muted">镜像下载中，稍后即可新建实例。</p>';
+  return `<div class="card"><h2>新建实例</h2>
+    <form class="row" id="create-form">
+      <label>系统<select name="os_image">${node.images.map(i => `<option value="${esc(i.id)}">${esc(i.name)}</option>`).join('')}</select></label>
+      <label>CPU（核）<input name="cpu" type="number" min="1" value="1" style="width:80px"></label>
+      <label>内存（MB）<input name="ram_mb" type="number" min="128" step="128" value="512" style="width:100px"></label>
+      <label>磁盘（GB）<input name="disk_gb" type="number" min="1" value="10" style="width:90px"></label>
+      <label>带宽（Mbps，0 不限）<input name="bandwidth_mbps" type="number" min="0" value="0" style="width:110px"></label>
+      <label>root 密码（留空生成）<input name="root_password" autocomplete="off" style="width:160px"></label>
+      <button class="btn primary">创建</button>
+    </form></div>`;
+}
+
+function forwardsCell(i) {
+  const rows = (i.forwards || []).map(f => `<div>${esc(f.host_port)}/${esc(f.proto)} → ${esc(f.guest_port)}${
+    standalone() ? ` <button class="btn danger" data-act="fwd-del" data-proto="${esc(f.proto)}" data-port="${esc(f.host_port)}" title="删除">×</button>` : ''}</div>`);
+  if (standalone()) rows.push('<button class="btn" data-act="fwd-add">+ 转发</button>');
+  return rows.join('') || '<span class="muted">-</span>';
+}
+
 async function loadInstances() {
   const el = $('#tab-instances');
   try {
+    await refreshNode();
     const list = await api('/api/instances');
-    if (!list.length) { el.innerHTML = '<p class="muted">此节点上还没有实例。实例由平台创建。</p>'; return; }
-    el.innerHTML = `<div class="table-wrap"><table>
+    const head = standalone() ? createForm()
+      : '<p class="muted">此节点由平台管理：新建、删除、重装和端口转发请在平台上操作。</p>';
+    if (!list.length) { el.innerHTML = head + '<p class="muted section">此节点上还没有实例。</p>'; return; }
+    el.innerHTML = head + `<div class="table-wrap section"><table>
       <tr><th>实例</th><th>状态</th><th>规格</th><th>地址</th><th>端口转发</th><th>本月流量</th><th>操作</th></tr>
-      ${list.map(i => `<tr>
+      ${list.map(i => `<tr data-id="${esc(i.id)}">
         <td><div>${esc(i.hostname || '-')}</div><div class="muted mono">${esc(i.id)}</div><div class="muted">${esc(i.os_image)}</div></td>
         <td><span class="badge ${esc(i.status)}">${esc({running:'运行中',stopped:'已停止',creating:'创建中',error:'异常'}[i.status] || i.status)}</span>
             ${i.status === 'running' ? `<div class="muted">CPU ${i.cpu_pct.toFixed(1)}% · ${i.ram_used_mb} MB</div>` : ''}</td>
         <td>${i.cpu} 核 / ${i.ram_mb} MB<br>${i.disk_gb} GB · ${i.bandwidth_mbps ? i.bandwidth_mbps + ' Mbps' : '不限速'}</td>
         <td class="mono">${i.ips.map(esc).join('<br>')}${i.dedicated.length ? '<br><span class="badge ok">独立 IP</span><br>' + i.dedicated.map(esc).join('<br>') : ''}</td>
-        <td class="mono">${(i.forwards || []).map(f => `${esc(f.host_port)}/${esc(f.proto)} → ${esc(f.guest_port)}`).join('<br>') || '<span class="muted">-</span>'}</td>
+        <td class="mono">${forwardsCell(i)}</td>
         <td>↓ ${bytes(i.month_in)}<br>↑ ${bytes(i.month_out)}</td>
-        <td><div class="actions" data-id="${esc(i.id)}">
+        <td><div class="actions">
           ${i.status === 'running'
             ? `<button class="btn" data-act="console">终端</button><button class="btn" data-act="restart">重启</button><button class="btn" data-act="stop">关机</button><button class="btn danger" data-act="force_stop">强制关机</button>`
             : `<button class="btn primary" data-act="start">开机</button>`}
           <button class="btn" data-act="password">改密码</button><button class="btn" data-act="log">日志</button>
+          ${standalone() ? '<button class="btn" data-act="reinstall">重装</button><button class="btn danger" data-act="delete">删除</button>' : ''}
         </div></td></tr>`).join('')}
     </table></div>`;
   } catch (e) { el.textContent = e.message; }
 }
 
+function credentials(title, r) {
+  dialog(title, `<div class="kv">
+    ${r.id ? `<span class="muted">实例 ID</span><code>${esc(r.id)}</code>` : ''}
+    <span class="muted">root 密码</span><code>${esc(r.root_password)}</code>
+    <span class="muted">SSH</span><code>${esc(sshHint(r.ssh_port))}</code></div>
+    <p class="muted">密码只显示这一次，请妥善保存。</p>`);
+}
+
+$('#tab-instances').addEventListener('submit', async e => {
+  if (e.target.id !== 'create-form') return;
+  e.preventDefault();
+  const f = new FormData(e.target), btn = e.target.querySelector('button');
+  const body = { os_image: f.get('os_image'), cpu: +f.get('cpu'), ram_mb: +f.get('ram_mb'), disk_gb: +f.get('disk_gb'),
+    bandwidth_mbps: +f.get('bandwidth_mbps'), root_password: f.get('root_password') || '' };
+  btn.disabled = true;
+  try { credentials('实例已创建', await api('/api/instances', { method: 'POST', body })); e.target.reset(); }
+  catch (err) { toast('创建失败：' + err.message); }
+  btn.disabled = false;
+  loadInstances();
+});
+
 $('#tab-instances').addEventListener('click', async e => {
   const b = e.target.closest('button[data-act]'); if (!b) return;
-  const id = b.parentElement.dataset.id, act = b.dataset.act;
+  const id = b.closest('tr').dataset.id, act = b.dataset.act;
   if (act === 'console') return openConsole(id);
   if (act === 'log') return openLog(id);
-  if (act === 'password') {
-    const pw = prompt('新的 root 密码'); if (!pw) return;
-    try { await api(`/api/instances/${id}/password`, { method: 'POST', body: { password: pw } }); toast('root 密码已更新'); }
-    catch (err) { toast('失败：' + err.message); }
-    return;
-  }
-  const names = { start: '开机', stop: '关机', force_stop: '强制关机', restart: '重启' };
-  if (act !== 'start' && !confirm(`确定要${names[act]}该实例？`)) return;
-  b.disabled = true;
-  try { await api(`/api/instances/${id}/power`, { method: 'POST', body: { action: act } }); toast(names[act] + '完成'); }
-  catch (err) { toast('失败：' + err.message); }
+  try {
+    if (act === 'password') {
+      const pw = prompt('新的 root 密码'); if (!pw) return;
+      await api(`/api/instances/${id}/password`, { method: 'POST', body: { password: pw } }); toast('root 密码已更新');
+    } else if (act === 'reinstall') {
+      const os = prompt(`重装为哪个系统？（${node.images.map(i => i.id).join(' / ')}）\n磁盘上的数据将全部清除。`, node.images[0]?.id || '');
+      if (!os) return;
+      b.disabled = true;
+      credentials('重装完成', await api(`/api/instances/${id}/reinstall`, { method: 'POST', body: { os_image: os.trim() } }));
+    } else if (act === 'delete') {
+      if (prompt('删除后数据无法恢复。输入 delete 确认：') !== 'delete') return;
+      b.disabled = true;
+      await api(`/api/instances/${id}`, { method: 'DELETE' }); toast('实例已删除');
+    } else if (act === 'fwd-add') {
+      const guest = prompt('转发到实例的哪个端口？'); if (!guest) return;
+      const proto = (prompt('协议（tcp / udp）', 'tcp') || 'tcp').trim();
+      const host = prompt('宿主机端口（留空自动分配）', '') || '0';
+      const r = await api(`/api/instances/${id}/forwards`, { method: 'POST', body: { proto, host_port: +host, guest_port: +guest } });
+      toast(`已添加：${node.entry}:${r.host_port} → ${guest}/${proto}`);
+    } else if (act === 'fwd-del') {
+      if (!confirm(`删除端口转发 ${b.dataset.port}/${b.dataset.proto}？`)) return;
+      await api(`/api/instances/${id}/forwards/${b.dataset.proto}/${b.dataset.port}`, { method: 'DELETE' }); toast('已删除');
+    } else {
+      const names = { start: '开机', stop: '关机', force_stop: '强制关机', restart: '重启' };
+      if (act !== 'start' && !confirm(`确定要${names[act]}该实例？`)) return;
+      b.disabled = true;
+      await api(`/api/instances/${id}/power`, { method: 'POST', body: { action: act } }); toast(names[act] + '完成');
+    }
+  } catch (err) { toast('失败：' + err.message); }
   loadInstances();
+});
+
+// ── dedicated IPs ──
+async function loadWg() {
+  const el = $('#tab-wg');
+  try {
+    await refreshNode();
+    if (!standalone()) {
+      el.innerHTML = '<p class="muted">此节点由平台管理：独立 IP 的绑定由平台下发，已生效的地址显示在「实例」页。</p>';
+      return;
+    }
+    const [wg, list] = await Promise.all([api('/api/wg'), api('/api/instances')]);
+    const host = id => (list.find(i => i.id === id) || {}).hostname || id;
+    el.innerHTML = `
+      <p class="muted">通过 WireGuard 把独立公网 IPv4/IPv6 绑定到实例：地址直接配在实例网卡上，出站、入站、监听都使用它。</p>
+      <div class="table-wrap"><table>
+        <tr><th>独立 IP</th><th>实例</th><th>网关</th><th></th></tr>
+        ${wg.bindings.map(b => `<tr><td class="mono">${esc(b.address)}</td><td>${esc(host(b.vm_id))}</td><td class="mono">${esc(b.endpoint)}</td>
+          <td><button class="btn danger" data-del="${esc(b.resource_id)}">解绑</button></td></tr>`).join('') || '<tr><td colspan="4" class="muted">尚未绑定</td></tr>'}
+      </table></div>
+      <div class="card section"><h2>绑定独立 IP</h2>
+        ${list.length ? `<form id="wg-form">
+          <label class="muted">实例 <select name="vm_id">${list.map(i => `<option value="${esc(i.id)}">${esc(i.hostname)} (${esc(i.ips[0] || '')})</option>`).join('')}</select></label>
+          <p class="muted">粘贴 WireGuard 配置（wg-quick 格式，包含 [Interface] 的 PrivateKey、Address 和 [Peer] 的 PublicKey、Endpoint）：</p>
+          <textarea name="config" rows="10" style="width:100%;font-family:monospace" required></textarea>
+          <p><button class="btn primary">绑定</button></p></form>` : '<p class="muted">先创建实例。</p>'}
+      </div>`;
+  } catch (e) { el.textContent = e.message; }
+}
+$('#tab-wg').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  try { await api('/api/wg', { method: 'POST', body: { vm_id: f.get('vm_id'), config: f.get('config') } }); toast('已绑定，地址将在几秒内生效'); }
+  catch (err) { toast('绑定失败：' + err.message); }
+  loadWg();
+});
+$('#tab-wg').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-del]'); if (!b) return;
+  if (!confirm('解绑这个独立 IP？')) return;
+  try { await api('/api/wg/' + encodeURIComponent(b.dataset.del), { method: 'DELETE' }); toast('已解绑'); }
+  catch (err) { toast('失败：' + err.message); }
+  loadWg();
 });
 
 function dialog(title, html, onClose) {
@@ -354,12 +473,13 @@ async function loadSettings() {
     el.innerHTML = `
       <div class="card"><h2>平台对接</h2>
         <div class="kv"><span class="muted">平台地址</span><code>${esc(s.platform_url)}</code>
-          <span class="muted">对接 Token</span><span><code>${esc(s.token_hint || '未设置')}</code></span></div>
+          <span class="muted">当前模式</span><span>${s.token_hint ? `平台模式（Token <code>${esc(s.token_hint)}</code>）` : '独立模式（不连接平台）'}</span></div>
         <form class="row section" id="token-form">
-          <label>新 Token（留空自动生成）<input name="token" style="width:320px" autocomplete="off"></label>
-          <button class="btn">轮换 Token</button>
+          <label>平台下发的 Token<input name="token" style="width:360px" autocomplete="off" required></label>
+          <button class="btn primary">接入平台</button>
+          ${s.token_hint ? '<button class="btn danger" type="button" id="token-clear">断开平台（独立模式）</button>' : ''}
         </form>
-        <p class="muted">轮换后会立即用新 Token 重连平台；平台侧需同步更新。</p>
+        <p class="muted">Token 由平台生成。接入后实例的新建、删除、端口转发和独立 IP 由平台管理；清除 Token 后节点独立运行。</p>
       </div>
       <div class="card section"><h2>节点信息</h2>
         <form class="row" id="settings-form">
@@ -379,14 +499,27 @@ async function loadSettings() {
   } catch (e) { el.textContent = e.message; }
 }
 
+$('#tab-settings').addEventListener('click', async e => {
+  if (e.target.id !== 'token-clear') return;
+  if (!confirm('断开平台后，节点不再向平台上报，实例改由本面板管理。继续？')) return;
+  try { await api('/api/settings/token', { method: 'POST', body: { token: '' } }); toast('已切换为独立模式'); }
+  catch (err) { toast('失败：' + err.message); }
+  loadSettings();
+});
+
 $('#tab-settings').addEventListener('submit', async e => {
   e.preventDefault();
   const f = new FormData(e.target);
   try {
     if (e.target.id === 'token-form') {
-      if (!confirm('轮换后旧 Token 立即失效，确定继续？')) return;
-      const r = await api('/api/settings/token', { method: 'POST', body: { token: f.get('token') || null } });
-      dialog('新的对接 Token', `<p>请复制并更新到平台（只显示这一次）：</p><pre class="log">${esc(r.token)}</pre>`);
+      const token = String(f.get('token')).trim();
+      try { await api('/api/settings/token', { method: 'POST', body: { token } }); }
+      catch (err) {
+        if (err.status !== 409) throw err;
+        if (!confirm(err.message + '\n\n平台会删除它不认识的本地实例，确定接入？')) return;
+        await api('/api/settings/token', { method: 'POST', body: { token, confirm: true } });
+      }
+      toast('已接入平台，正在连接…');
     } else if (e.target.id === 'settings-form') {
       await api('/api/settings', { method: 'PUT', body: { host: f.get('host').trim(), bandwidth_mbps: +f.get('bandwidth_mbps') } });
       toast('已保存');

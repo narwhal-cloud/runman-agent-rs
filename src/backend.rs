@@ -89,3 +89,47 @@ pub struct Services {
     pub wg: Arc<dyn WgBindings>,
     pub host: Arc<dyn HostMetrics>,
 }
+
+/// Every instance gets a random host port forwarded to SSH (22/tcp), as the
+/// Go agent did. Failure is logged, not fatal: the instance itself exists.
+/// Returns the host port of the SSH forward, if there is one.
+pub async fn ensure_ssh_forward(pf: &dyn PortForwards, id: &VmId) -> Option<u16> {
+    match pf.list(Some(id)).await {
+        Ok(rules) => {
+            if let Some(r) = rules
+                .iter()
+                .find(|r| r.proto == L4Proto::Tcp && r.guest_port == 22)
+            {
+                return Some(r.host_port);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("ssh forward for {id}: list rules: {e:#}");
+            return None;
+        }
+    }
+    for _ in 0..5 {
+        let host_port = match pf.free_port().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("ssh forward for {id}: {e:#}");
+                return None;
+            }
+        };
+        let rule = PortForward {
+            vm_id: id.clone(),
+            proto: L4Proto::Tcp,
+            host_port,
+            guest_port: 22,
+            description: "ssh".into(),
+        };
+        match pf.add(rule).await {
+            Ok(()) => {
+                tracing::info!("ssh forward for {id}: {host_port} -> 22");
+                return Some(host_port);
+            }
+            Err(e) => tracing::warn!("ssh forward for {id} on {host_port}: {e:#}"),
+        }
+    }
+    None
+}

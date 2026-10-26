@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use runman_agent::config::{self, BackendKind};
-#[cfg(target_os = "linux")]
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use runman_agent::backend::Services;
 use runman_agent::fake::Fake;
+use runman_agent::local_wg::LocalWg;
 #[cfg(target_os = "linux")]
 use runman_agent::metrics::ProcMetrics;
 use runman_agent::platform::{Agent, Timing};
@@ -35,11 +35,15 @@ enum Command {
     Run,
     /// Set the management panel password, read from stdin (first line).
     SetPassword,
-    /// Set the platform integration token and print it.
+    /// Set the token issued by the platform (restart the agent afterwards).
     SetToken {
-        /// Use this token instead of generating a random one.
-        #[arg(long)]
+        /// Token from the platform.
+        #[arg(required_unless_present = "clear")]
         token: Option<String>,
+        /// Remove the token: the agent stops talking to the platform and the
+        /// panel manages the node on its own.
+        #[arg(long, conflicts_with = "token")]
+        clear: bool,
     },
     /// Probe the host and print suggested IPv6 settings for `[network]`.
     DetectIpv6,
@@ -97,10 +101,21 @@ async fn agent_main() -> Result<()> {
             return Ok(());
         }
         Some(Command::DetectIpv6) => unreachable!("handled above"),
-        Some(Command::SetToken { token }) => {
-            let token = token.unwrap_or_else(|| runman_agent::web::random_token(48));
+        Some(Command::SetToken { token, clear }) => {
+            let token = if clear {
+                String::new()
+            } else {
+                token.unwrap_or_default()
+            };
             store.update(|c| c.token = token.clone())?;
-            println!("{token}");
+            println!(
+                "{}",
+                if clear {
+                    "platform token cleared (standalone mode)"
+                } else {
+                    "platform token set"
+                }
+            );
             return Ok(());
         }
     }
@@ -111,6 +126,7 @@ async fn agent_main() -> Result<()> {
         cfg.backend
     );
 
+    let local_wg = Arc::new(LocalWg::load(&cfg.data_dir)?);
     let services = match cfg.backend {
         BackendKind::Fake => Fake::new().services(),
         #[cfg(not(target_os = "linux"))]
@@ -120,9 +136,17 @@ async fn agent_main() -> Result<()> {
             let rt = Arc::new(Runtime::new(Options::from_config(&cfg))?);
             {
                 let rt = rt.clone();
+                let store_for_init = store.clone();
+                let local_wg_for_init = local_wg.clone();
                 tokio::spawn(async move {
                     if let Err(e) = rt.init().await {
                         tracing::error!("runtime init: {e:#}");
+                    }
+                    // Standalone: nobody else will hand out the bindings.
+                    if store_for_init.get().token.is_empty()
+                        && let Err(e) = local_wg_for_init.apply(rt.as_ref()).await
+                    {
+                        tracing::warn!("apply local dedicated IPs: {e:#}");
                     }
                     rt.images().sync().await;
                 });
@@ -155,7 +179,12 @@ async fn agent_main() -> Result<()> {
     tokio::spawn(updater.clone().run(shutdown.clone()));
     tokio::spawn(agent.clone().entry_loop(shutdown.clone()));
     if !cfg.web_listen.is_empty() {
-        let web = Web::new(agent.clone(), services, Some(updater.clone()));
+        let web = Web::new(
+            agent.clone(),
+            services,
+            Some(updater.clone()),
+            local_wg.clone(),
+        );
         let listen = cfg.web_listen.parse()?;
         let stop = shutdown.clone();
         tokio::spawn(async move {

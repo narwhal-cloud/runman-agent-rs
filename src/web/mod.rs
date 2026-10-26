@@ -33,8 +33,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::backend::Services;
+use crate::backend::ensure_ssh_forward;
 use crate::config;
-use crate::model::{ConsoleSize, VmId, validate_password};
+use crate::local_wg::{LocalWg, parse_wg_quick};
+use crate::model::{ConsoleSize, InstanceSpec, L4Proto, PortForward, VmId, validate_password};
 use crate::platform::Agent;
 use crate::updater::{Outcome, Updater};
 
@@ -50,17 +52,24 @@ pub struct Web {
     agent: Arc<Agent>,
     services: Services,
     updater: Option<Arc<Updater>>,
+    local_wg: Arc<LocalWg>,
     sessions: Mutex<HashMap<String, Instant>>,
     failures: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     http: Client<HttpConnector, Body>,
 }
 
 impl Web {
-    pub fn new(agent: Arc<Agent>, services: Services, updater: Option<Arc<Updater>>) -> Arc<Self> {
+    pub fn new(
+        agent: Arc<Agent>,
+        services: Services,
+        updater: Option<Arc<Updater>>,
+        local_wg: Arc<LocalWg>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             agent,
             services,
             updater,
+            local_wg,
             sessions: Mutex::default(),
             failures: Mutex::default(),
             http: Client::builder(TokioExecutor::new()).build_http(),
@@ -69,6 +78,25 @@ impl Web {
 
     fn cfg(&self) -> &config::Store {
         self.agent.config()
+    }
+
+    /// No platform token: the panel manages everything itself.
+    fn standalone(&self) -> bool {
+        self.cfg().get().token.is_empty()
+    }
+
+    /// Lifecycle, port forwards and dedicated IPs belong to the platform
+    /// once a token is set; local changes would be undone by it (instances
+    /// it does not know are deleted as orphans).
+    fn require_standalone(&self) -> ApiResult<()> {
+        if self.standalone() {
+            Ok(())
+        } else {
+            Err(err(
+                StatusCode::CONFLICT,
+                "this node is managed by the platform; make this change there",
+            ))
+        }
     }
 
     pub async fn serve(
@@ -90,13 +118,25 @@ impl Web {
     ) -> Result<()> {
         let protected = Router::new()
             .route("/api/overview", get(overview))
-            .route("/api/instances", get(instances))
+            .route("/api/instances", get(instances).post(create_instance))
+            .route(
+                "/api/instances/{id}",
+                axum::routing::delete(delete_instance),
+            )
+            .route("/api/instances/{id}/reinstall", post(reinstall_instance))
+            .route("/api/instances/{id}/forwards", post(add_forward))
+            .route(
+                "/api/instances/{id}/forwards/{proto}/{port}",
+                axum::routing::delete(delete_forward),
+            )
+            .route("/api/wg", get(list_wg).post(add_wg))
+            .route("/api/wg/{resource}", axum::routing::delete(delete_wg))
             .route("/api/instances/{id}/power", post(power))
             .route("/api/instances/{id}/password", post(reset_password))
             .route("/api/instances/{id}/console-log", get(console_log))
             .route("/api/instances/{id}/tty", get(tty))
             .route("/api/settings", get(get_settings).put(put_settings))
-            .route("/api/settings/token", post(rotate_token))
+            .route("/api/settings/token", post(set_token))
             .route("/api/settings/password", post(change_password))
             .route("/api/rfw/status", get(rfw_status))
             .route("/api/update", post(update_now))
@@ -316,6 +356,7 @@ async fn overview(State(web): State<Arc<Web>>) -> ApiResult<Json<Value>> {
         .map(|d| d.as_secs());
     Ok(Json(json!({
         "version": crate::updater::version(),
+        "mode": if cfg.token.is_empty() { "standalone" } else { "platform" },
         "update": web.updater.as_ref().map(|u| u.status()),
         "platform": {
             "url": cfg.platform_url,
@@ -468,6 +509,243 @@ async fn bridge_tty(mut socket: WebSocket, mut io: crate::backend::ConsoleIo) {
     // Dropping `io` (and its input sender) closes the console session.
 }
 
+// ── standalone management ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateReq {
+    os_image: String,
+    cpu: u32,
+    ram_mb: u64,
+    disk_gb: u64,
+    #[serde(default)]
+    bandwidth_mbps: u32,
+    /// Empty: generate one.
+    #[serde(default)]
+    root_password: String,
+}
+
+fn limits(cpu: u32, ram_mb: u64, disk_gb: u64, bandwidth_mbps: u32) -> ApiResult<()> {
+    if !(1..=256).contains(&cpu)
+        || !(128..=1 << 20).contains(&ram_mb)
+        || !(1..=1 << 16).contains(&disk_gb)
+        || bandwidth_mbps > 100_000
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "cpu 1-256, ram 128 MB-1 TB, disk 1 GB-64 TB, bandwidth ≤ 100000 Mbps",
+        ));
+    }
+    Ok(())
+}
+
+async fn create_instance(
+    State(web): State<Arc<Web>>,
+    Json(req): Json<CreateReq>,
+) -> ApiResult<Json<Value>> {
+    web.require_standalone()?;
+    limits(req.cpu, req.ram_mb, req.disk_gb, req.bandwidth_mbps)?;
+    let password = if req.root_password.is_empty() {
+        random_token(16)
+    } else {
+        req.root_password
+    };
+    validate_password(&password)?;
+    let spec = InstanceSpec {
+        vm_id: VmId::parse(&uuid::Uuid::new_v4().to_string())?,
+        cpu: req.cpu,
+        ram_mb: req.ram_mb,
+        disk_gb: req.disk_gb,
+        bandwidth_mbps: req.bandwidth_mbps,
+        os_image: req.os_image,
+        root_password: password.clone(),
+    };
+    web.services.instances.create(&spec).await?;
+    let ssh_port = ensure_ssh_forward(web.services.port_forwards.as_ref(), &spec.vm_id).await;
+    info!("panel: created {} ({})", spec.vm_id, spec.os_image);
+    Ok(Json(
+        json!({ "id": spec.vm_id, "root_password": password, "ssh_port": ssh_port }),
+    ))
+}
+
+async fn delete_instance(
+    State(web): State<Arc<Web>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    web.require_standalone()?;
+    let id = vm(&id)?;
+    web.services.instances.delete(&id).await?;
+    web.services.port_forwards.remove_all(&id).await?;
+    if web.local_wg.remove(None, Some(id.as_str()))? {
+        web.local_wg.apply(web.services.wg.as_ref()).await?;
+    }
+    info!("panel: deleted {id}");
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ReinstallReq {
+    os_image: String,
+    #[serde(default)]
+    root_password: String,
+}
+
+async fn reinstall_instance(
+    State(web): State<Arc<Web>>,
+    Path(id): Path<String>,
+    Json(req): Json<ReinstallReq>,
+) -> ApiResult<Json<Value>> {
+    web.require_standalone()?;
+    let id = vm(&id)?;
+    let current = web
+        .services
+        .instances
+        .details()
+        .await?
+        .into_iter()
+        .find(|d| d.id == id.as_str())
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "instance not found"))?;
+    if current.cpu == 0 || current.ram_mb == 0 || current.disk_gb == 0 {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "the instance's plan is unknown; cannot reinstall",
+        ));
+    }
+    let password = if req.root_password.is_empty() {
+        random_token(16)
+    } else {
+        req.root_password
+    };
+    validate_password(&password)?;
+    let spec = InstanceSpec {
+        vm_id: id.clone(),
+        cpu: current.cpu,
+        ram_mb: current.ram_mb,
+        disk_gb: current.disk_gb,
+        bandwidth_mbps: current.bandwidth_mbps,
+        os_image: req.os_image,
+        root_password: password.clone(),
+    };
+    web.services.instances.reinstall(&spec).await?;
+    let ssh_port = ensure_ssh_forward(web.services.port_forwards.as_ref(), &id).await;
+    info!("panel: reinstalled {id} with {}", spec.os_image);
+    Ok(Json(
+        json!({ "root_password": password, "ssh_port": ssh_port }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ForwardReq {
+    proto: String,
+    /// 0: pick a free port.
+    #[serde(default)]
+    host_port: u16,
+    guest_port: u16,
+}
+
+fn l4(proto: &str) -> ApiResult<L4Proto> {
+    match proto {
+        "tcp" => Ok(L4Proto::Tcp),
+        "udp" => Ok(L4Proto::Udp),
+        _ => Err(err(StatusCode::BAD_REQUEST, "proto must be tcp or udp")),
+    }
+}
+
+async fn add_forward(
+    State(web): State<Arc<Web>>,
+    Path(id): Path<String>,
+    Json(req): Json<ForwardReq>,
+) -> ApiResult<Json<Value>> {
+    web.require_standalone()?;
+    let id = vm(&id)?;
+    let proto = l4(&req.proto)?;
+    if req.guest_port == 0 {
+        return Err(err(StatusCode::BAD_REQUEST, "guest_port is required"));
+    }
+    let pf = &web.services.port_forwards;
+    let host_port = if req.host_port == 0 {
+        pf.free_port().await?
+    } else {
+        req.host_port
+    };
+    pf.add(PortForward {
+        vm_id: id.clone(),
+        proto,
+        host_port,
+        guest_port: req.guest_port,
+        description: String::new(),
+    })
+    .await?;
+    info!(
+        "panel: forward {host_port}/{} -> {id}:{}",
+        proto.as_str(),
+        req.guest_port
+    );
+    Ok(Json(json!({ "host_port": host_port })))
+}
+
+async fn delete_forward(
+    State(web): State<Arc<Web>>,
+    Path((id, proto, port)): Path<(String, String, u16)>,
+) -> ApiResult<Json<Value>> {
+    web.require_standalone()?;
+    let id = vm(&id)?;
+    web.services
+        .port_forwards
+        .remove(&id, l4(&proto)?, port)
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn list_wg(State(web): State<Arc<Web>>) -> Json<Value> {
+    let list: Vec<Value> = web
+        .local_wg
+        .list()
+        .iter()
+        .map(|b| json!({ "resource_id": b.resource_id, "vm_id": b.vm_id, "address": b.address, "endpoint": b.endpoint }))
+        .collect();
+    Json(json!({ "standalone": web.standalone(), "bindings": list }))
+}
+
+#[derive(Deserialize)]
+struct WgReq {
+    vm_id: String,
+    /// wg-quick configuration text.
+    config: String,
+}
+
+async fn add_wg(State(web): State<Arc<Web>>, Json(req): Json<WgReq>) -> ApiResult<Json<Value>> {
+    web.require_standalone()?;
+    let id = vm(&req.vm_id)?;
+    if !web
+        .services
+        .instances
+        .list()
+        .await?
+        .iter()
+        .any(|s| s.vm_id == id.as_str())
+    {
+        return Err(err(StatusCode::NOT_FOUND, "instance not found"));
+    }
+    let binding = parse_wg_quick(&req.config, &id)?;
+    let resource = binding.resource_id.clone();
+    web.local_wg.add(binding)?;
+    web.local_wg.apply(web.services.wg.as_ref()).await?;
+    info!("panel: dedicated IP {resource} bound to {id}");
+    Ok(Json(json!({ "resource_id": resource })))
+}
+
+async fn delete_wg(
+    State(web): State<Arc<Web>>,
+    Path(resource): Path<String>,
+) -> ApiResult<Json<Value>> {
+    web.require_standalone()?;
+    if !web.local_wg.remove(Some(&resource), None)? {
+        return Err(err(StatusCode::NOT_FOUND, "binding not found"));
+    }
+    web.local_wg.apply(web.services.wg.as_ref()).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 // ── settings ────────────────────────────────────────────────────────────────
 
 async fn get_settings(State(web): State<Arc<Web>>) -> Json<Value> {
@@ -518,22 +796,49 @@ async fn put_settings(
 
 #[derive(Deserialize)]
 struct TokenReq {
-    /// Custom token; empty or missing generates one.
-    token: Option<String>,
+    /// Token issued by the platform; empty clears it (standalone mode).
+    token: String,
+    /// Acknowledge that local instances will be removed by the platform.
+    #[serde(default)]
+    confirm: bool,
 }
 
-async fn rotate_token(
+async fn set_token(
     State(web): State<Arc<Web>>,
     Json(req): Json<TokenReq>,
 ) -> ApiResult<Json<Value>> {
-    let token = req
-        .token
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| random_token(48));
+    let token = req.token.trim().to_owned();
+    if !token.is_empty() && web.standalone() && !req.confirm {
+        let count = web
+            .services
+            .instances
+            .list()
+            .await
+            .map(|l| l.len())
+            .unwrap_or(0);
+        if count > 0 {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!(
+                    "{count} local instance(s) exist; the platform deletes instances it does not know. \
+                     Confirm to connect anyway"
+                ),
+            ));
+        }
+    }
     web.cfg().update(|c| c.token = token.clone())?;
     web.agent.reconnect_now();
-    info!("panel: integration token rotated");
-    Ok(Json(json!({ "token": token })))
+    if token.is_empty() {
+        info!("panel: platform token cleared, standalone mode");
+        if let Err(e) = web.local_wg.apply(web.services.wg.as_ref()).await {
+            warn!("apply local dedicated IPs: {e:#}");
+        }
+    } else {
+        info!("panel: platform token set");
+    }
+    Ok(Json(
+        json!({ "mode": if token.is_empty() { "standalone" } else { "platform" } }),
+    ))
 }
 
 #[derive(Deserialize)]

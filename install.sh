@@ -40,7 +40,9 @@ usage() {
     cat <<'EOF'
 Usage: install.sh [options]
 
-  --token TOKEN           Platform integration token (default: generate one)
+  --token TOKEN           Token issued by the platform. Without one the node runs
+                          standalone: it never contacts the platform and is
+                          managed entirely from its own panel
   --platform-url URL      Platform gRPC endpoint (default: https://hosting.fuckip.me:443)
   --web-listen ADDR       Management panel address (default 0.0.0.0:8792;
                           use 127.0.0.1:8792 to reach it only through an SSH tunnel)
@@ -303,10 +305,9 @@ EOF
 else
     log "keeping existing $CONFIG"
 fi
+# Tokens are only ever issued by the platform; none means standalone mode.
 if [ -n "$TOKEN" ]; then
-    "$BIN" --config "$CONFIG" set-token --token "$TOKEN" >/dev/null
-elif [ "$FRESH" = 1 ]; then
-    TOKEN=$("$BIN" --config "$CONFIG" set-token)
+    "$BIN" --config "$CONFIG" set-token "$TOKEN" >/dev/null
 fi
 
 # ── rfw ─────────────────────────────────────────────────────────────────────
@@ -429,7 +430,10 @@ fi
 if [ "$FRESH" = 1 ]; then
     echo "  login:   admin / $PASSWORD"
 fi
-if [ -n "$TOKEN" ]; then
-    echo "  token:   $TOKEN"
+if grep -qE '^token = ".+"' "$CONFIG"; then
+    echo "  mode:    platform (connects to $(sed -n 's/^platform_url = "\(.*\)"$/\1/p' "$CONFIG"))"
+else
+    echo "  mode:    standalone (no platform token; manage instances in the panel)"
+    echo "           connect later: runman-agent set-token '<token from the platform>' && systemctl restart runman-agent"
 fi
 echo "  OS images are downloaded in the background on first start (journalctl -fu runman-agent)."
