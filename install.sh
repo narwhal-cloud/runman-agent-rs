@@ -203,7 +203,7 @@ log "installing packages"
 apt_get() { LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -y -q "$@"; }
 apt_get update >/dev/null
 apt_get install --no-install-recommends \
-    ca-certificates curl iproute2 nftables wireguard-tools e2fsprogs tar gzip util-linux kmod lxcfs >/dev/null
+    ca-certificates curl iproute2 nftables wireguard-tools e2fsprogs tar gzip zstd util-linux kmod lxcfs >/dev/null
 
 for mod in wireguard ifb sch_cake tcp_bbr; do
     modprobe "$mod" 2>/dev/null || warn "kernel module $mod is unavailable; related features will fail"

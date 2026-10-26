@@ -1,0 +1,79 @@
+# Builds the official instance images from Debian/Alpine package sources and
+# publishes them, with a signed manifest, as the rolling "images" release that
+# agents sync from (image_base_url).
+name: Images
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # weekly, for security updates
+  push:
+    branches: [main]
+    paths: ["images/**", ".github/workflows/images.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: images
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { distro: debian, arch: amd64, runner: ubuntu-24.04 }
+          - { distro: debian, arch: arm64, runner: ubuntu-24.04-arm }
+          - { distro: alpine, arch: amd64, runner: ubuntu-24.04 }
+          - { distro: alpine, arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq mmdebstrap debian-archive-keyring zstd
+      - name: Build
+        run: sudo bash images/build.sh ${{ matrix.distro }} ${{ matrix.arch }} dist "$(date -u +%Y%m%d).${{ github.run_number }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ matrix.distro }}-${{ matrix.arch }}
+          path: dist/*
+          retention-days: 3
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Manifest and signature
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ] || [ -z "$UPDATE_PUBKEY" ]; then
+            echo "::error::UPDATE_SIGNING_KEY / UPDATE_PUBKEY are not configured; agents would reject an unsigned manifest"
+            exit 1
+          fi
+          cd dist
+          jq -s '{version: 1, images: .}' rootfs-*.json > images.json
+          umask 077
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/key.pem" -rawin -in images.json -out images.json.sig
+          rm -f "$RUNNER_TEMP/key.pem"
+          { printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00'; printf '%s' "$UPDATE_PUBKEY" | base64 -d; } > "$RUNNER_TEMP/pub.der"
+          openssl pkeyutl -verify -pubin -keyform DER -inkey "$RUNNER_TEMP/pub.der" -rawin -in images.json -sigfile images.json.sig
+          jq -c '.images[] | {id, arch, serial, size}' images.json
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          gh release delete images --yes --cleanup-tag 2>/dev/null || true
+          gh release create images images.json images.json.sig rootfs-*.tar.zst \
+            --title "Instance images" --latest=false --target "${{ github.sha }}" \
+            --notes "Instance root filesystems built by images/build.sh; agents sync them via images.json."

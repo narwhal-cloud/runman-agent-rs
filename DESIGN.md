@@ -67,7 +67,7 @@ rfw (独立进程, 127.0.0.1:7734)   eBPF/XDP 防火墙，由 agent 安装与反
 **资源**：cgroup v2 `cpu.max`（核数 × 100000/100000）、`memory.max` + `memory.swap.max`、`pids.max`、`io.max`。
 
 **磁盘与 30 s 约束**（已实现，创建实测约 0.25 s）
-- 镜像使用 narwhal-cloud/images 的预构建包，解压到 `images/<id>/<serial>/rootfs`，**保持原始属主**，所有实例共用、只读。
+- 镜像由本仓库的 `images/build.sh` 从发行版官方源构建（Debian 用 mmdebstrap 最小安装，Alpine 用 minirootfs 加 apk），由 `images.yml` 每周发布到 `images` Release，`images.json` 清单签名。节点按清单同步，校验签名和 SHA-256 后解压到 `images/<id>/<serial>/rootfs`，**保持原始属主**，所有实例共用、只读。已有实例保留它们创建时的版本，无人使用的旧版本自动删除。
 - 每个实例一个稀疏 ext4 文件 `disk.img`（`mkfs.ext4 -E lazy_itable_init` 不到 0.1 s），放 overlay 的 upper/work，容量就是套餐磁盘大小，容器里 `df` 显示正确，不依赖宿主机是 XFS。
 - overlayfs 本身不支持 idmapped mount（实测返回 EINVAL），因此 supervisor 对**镜像层和磁盘层分别**做 idmapped bind，再由容器在自己的 user namespace 里挂 overlay（`userxattr`）。磁盘上的文件始终是未偏移的属主，宿主机离线编辑无需换算。
 - 首次启动前由 agent 离线挂载 rootfs，写入主机名、root 密码哈希，清空 machine-id，删除镜像自带的 SSH host key（首启时重新生成），屏蔽容器里无法工作的 `sys-kernel-*.mount` 等单元，并禁用 cloud-init。所有写入都经 `openat2(RESOLVE_IN_ROOT)`，容器内的符号链接无法把宿主机 root 的写操作引到外面。

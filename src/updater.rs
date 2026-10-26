@@ -26,6 +26,12 @@ use tracing::{info, warn};
 use crate::config;
 
 const PUBKEY: Option<&str> = option_env!("RUNMAN_UPDATE_PUBKEY");
+
+/// The release signing key compiled into this build, if any (also verifies
+/// the image manifest).
+pub fn signing_key() -> Option<&'static str> {
+    PUBKEY
+}
 const FIRST_CHECK: Duration = Duration::from_secs(600);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 /// Upper bound of the random delay before applying a found update, so a

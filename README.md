@@ -70,6 +70,19 @@ openssl pkey -in update-signing-key.pem -pubout -outform DER | tail -c 32 | base
 
 更换密钥后，已部署的节点仍只信任旧公钥，需要用新版 `install.sh` 重新安装一次才能继续自动更新。
 
+## 实例镜像
+
+官方镜像由本仓库自己构建，不依赖其他仓库或第三方现成镜像：`images/build.sh` 直接从 Debian 官方源（mmdebstrap，最小安装、不带推荐包和文档）和 Alpine 官方 minirootfs 构建根文件系统。`.github/workflows/images.yml` 每周一（以及 `images/` 有改动时）构建 amd64 和 arm64，生成 `images.json` 清单并用与自更新相同的密钥签名，发布到滚动更新的 `images` Release。
+
+节点启动时以及每 6 小时同步一次：验证清单签名和每个文件的 SHA-256，有新版本就下载并作为新实例的默认版本；已有实例继续使用它们创建时的版本，没有实例使用的旧版本会被自动删除。
+
+| 镜像 | 压缩包 | 解压后 | 128 MB 实例开机后的内存 |
+|---|---|---|---|
+| Debian 13 | 31 MB | 136 MB | 9 MB |
+| Alpine 3.24 | 7 MB | 25 MB | 2 MB |
+
+本地构建：`sudo bash images/build.sh debian amd64 dist`（需要 mmdebstrap 和 zstd，且必须在目标架构上运行）。
+
 ## 开发
 
 ```bash
@@ -81,6 +94,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl   # 静态二进制
 
 ```bash
 sudo cargo test --release --test runtime_linux -- --ignored --test-threads=1
+# 可选：RUNMAN_TEST_IMAGE_URL=http://127.0.0.1:8998  使用本地构建的镜像（images.json 所在目录）
 # 可选：真实 /64 与 WireGuard 绑定
 #   RUNMAN_TEST_V6_PREFIX=2001:db8:1:2::/64 RUNMAN_TEST_V6_UPLINK=eth0
 #   RUNMAN_TEST_WG_CONFS=/root/wg4.conf,/root/wg6.conf   （wg-quick 格式）

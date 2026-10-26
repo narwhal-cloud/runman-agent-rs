@@ -1,9 +1,15 @@
-//! Image templates: prebuilt rootfs trees, unpacked once and shared read-only
-//! as the overlay lower layer of every instance.
+//! Image templates: root filesystems unpacked once and shared read-only as the
+//! overlay lower layer of every instance.
 //!
-//! Layout: `<data>/images/<id>/<serial>/rootfs`, `<serial>/meta.json`, and a
-//! `current` symlink pointing at the serial new instances should use. Older
-//! serials stay until no instance references them.
+//! Layout: `<data>/images/<id>/<serial>/{rootfs,meta.json}` plus a `current`
+//! symlink to the serial new instances use. Instances keep the serial they
+//! were created from; [`ImageStore::gc`] removes serials nobody uses.
+//!
+//! Official images come from `image_base_url`: `images.json` (signed as
+//! `images.json.sig` with the release key), listing per-arch
+//! `rootfs-<id>-<arch>.tar.zst` with SHA-256 and size. They are built by
+//! `images/build.sh` in this repository. Custom images are built on the node
+//! (see `Runtime::build_image`) and stored the same way.
 
 use std::path::{Path, PathBuf};
 
@@ -14,34 +20,62 @@ use tracing::{info, warn};
 
 use super::fsutil::{mkdir_private, replace_symlink};
 
-pub struct ImageDef {
-    pub id: &'static str,
-    /// Prebuilt asset name; `{arch}` is `amd64` or `arm64`.
-    asset: &'static str,
-    pub stop_signal: &'static str,
-}
-
-pub const IMAGES: &[ImageDef] = &[
-    ImageDef {
-        id: "debian",
-        asset: "incus-debian-{arch}.tar.gz",
-        stop_signal: "SIGRTMIN+4",
-    },
-    ImageDef {
-        id: "alpine",
-        asset: "incus-alpine-{arch}.tar.gz",
-        stop_signal: "SIGUSR2",
-    },
-];
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Image {
     pub id: String,
     pub name: String,
     pub serial: String,
     pub stop_signal: String,
+    /// Built on this node from `base` with `script`.
+    #[serde(default)]
+    pub custom: bool,
+    #[serde(default)]
+    pub base: String,
+    #[serde(default)]
+    pub script: String,
     #[serde(skip)]
     pub rootfs: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Manifest {
+    images: Vec<ManifestEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ManifestEntry {
+    id: String,
+    name: String,
+    serial: String,
+    stop_signal: String,
+    arch: String,
+    file: String,
+    sha256: String,
+    size: u64,
+}
+
+/// Image ids end up in paths and in the platform's `os_image`.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 40
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !id.starts_with('-')
+}
+
+/// Serial as a directory name: overlayfs option syntax reserves ':' and ','.
+fn dir_name(serial: &str) -> String {
+    serial
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 pub struct ImageStore {
@@ -66,122 +100,217 @@ impl ImageStore {
         })
     }
 
-    /// Images that are unpacked and usable now.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Every image with a current version, official and custom.
     pub fn ready(&self) -> Vec<Image> {
-        IMAGES.iter().filter_map(|d| self.get(d.id).ok()).collect()
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Image> = entries
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|id| valid_id(id))
+            .filter_map(|id| self.get(&id).ok())
+            .collect();
+        // Official images first, then custom ones by name.
+        out.sort_by(|a, b| (a.custom, &a.name).cmp(&(b.custom, &b.name)));
+        out
     }
 
     pub fn get(&self, id: &str) -> Result<Image> {
-        let def = def(id)?;
-        let current = self.dir.join(def.id).join("current");
+        if !valid_id(id) {
+            bail!("invalid image id {id:?}");
+        }
+        let current = self.dir.join(id).join("current");
         let serial_dir = std::fs::canonicalize(&current)
-            .with_context(|| format!("image {id} is not downloaded yet"))?;
+            .with_context(|| format!("image {id:?} is not available"))?;
         let mut img: Image = serde_json::from_slice(&std::fs::read(serial_dir.join("meta.json"))?)?;
         img.rootfs = serial_dir.join("rootfs");
         Ok(img)
     }
 
-    /// Download and unpack every image that is not present yet.
-    pub async fn sync(&self) {
-        for d in IMAGES {
-            if self.get(d.id).is_ok() {
-                continue;
-            }
-            match self.fetch(d).await {
-                Ok(img) => info!("image {} ready ({})", img.id, img.name),
-                Err(e) => warn!("image {}: {e:#}", d.id),
-            }
-        }
-    }
-
-    async fn fetch(&self, def: &ImageDef) -> Result<Image> {
-        let image_dir = self.dir.join(def.id);
-        mkdir_private(&image_dir)?;
-        let staging = image_dir.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+    /// Fetch the manifest and download images whose serial is new.
+    pub async fn sync(&self) -> Result<()> {
+        let staging = self.dir.join(format!(".staging-{}", uuid::Uuid::new_v4()));
         mkdir_private(&staging)?;
-        let result = self.fetch_into(def, &image_dir, &staging).await;
+        let result = self.sync_into(&staging).await;
         let _ = tokio::fs::remove_dir_all(&staging).await;
         result
     }
 
-    async fn fetch_into(&self, def: &ImageDef, image_dir: &Path, staging: &Path) -> Result<Image> {
-        let url = format!(
-            "{}/{}",
-            self.base_url,
-            def.asset.replace("{arch}", self.arch)
+    async fn sync_into(&self, staging: &Path) -> Result<()> {
+        let manifest_path = staging.join("images.json");
+        fetch(&format!("{}/images.json", self.base_url), &manifest_path).await?;
+        let raw = std::fs::read(&manifest_path)?;
+        match crate::updater::signing_key() {
+            Some(key) => {
+                let sig_path = staging.join("images.json.sig");
+                fetch(&format!("{}/images.json.sig", self.base_url), &sig_path).await?;
+                crate::updater::verify_signature(key, &raw, &std::fs::read(&sig_path)?)
+                    .context("images.json signature")?;
+            }
+            None => warn!("this build has no signing key; image manifest is not signature-checked"),
+        }
+        let manifest: Manifest = serde_json::from_slice(&raw).context("parse images.json")?;
+        for entry in manifest.images.iter().filter(|e| e.arch == self.arch) {
+            if !valid_id(&entry.id)
+                || !entry.file.starts_with("rootfs-")
+                || entry.file.contains('/')
+            {
+                warn!("skipping invalid manifest entry {:?}", entry.id);
+                continue;
+            }
+            let image_dir = self.dir.join(&entry.id);
+            let serial_dir = image_dir.join(dir_name(&entry.serial));
+            if !serial_dir.join("meta.json").exists() {
+                if let Err(e) = self.fetch_entry(entry, staging, &serial_dir).await {
+                    warn!("image {} {}: {e:#}", entry.id, entry.serial);
+                    continue;
+                }
+                info!(
+                    "image {} ready ({}, {})",
+                    entry.id, entry.name, entry.serial
+                );
+            }
+            replace_symlink(&dir_name(&entry.serial), &image_dir.join("current"))?;
+        }
+        Ok(())
+    }
+
+    async fn fetch_entry(
+        &self,
+        e: &ManifestEntry,
+        staging: &Path,
+        serial_dir: &Path,
+    ) -> Result<()> {
+        let archive = staging.join(&e.file);
+        info!(
+            "downloading image {} {} ({} MB)",
+            e.id,
+            e.serial,
+            e.size >> 20
         );
-        let archive = staging.join("image.tar.gz");
-        info!("downloading image {} from {url}", def.id);
-        run(Command::new("curl")
-            .args(["-fsSL", "--retry", "3", "--connect-timeout", "20", "-o"])
-            .arg(&archive)
-            .arg(&url))
-        .await
-        .context("download")?;
-        let tree = staging.join("tree");
+        fetch(&format!("{}/{}", self.base_url, e.file), &archive).await?;
+        let len = std::fs::metadata(&archive)?.len();
+        if len != e.size {
+            bail!("size {len} does not match manifest ({})", e.size);
+        }
+        let data = tokio::fs::read(&archive).await?;
+        if crate::updater::hex_sha256(&data) != e.sha256.to_ascii_lowercase() {
+            bail!("checksum does not match manifest");
+        }
+        drop(data);
+        let tree = staging.join(format!("tree-{}", e.id));
+        let rootfs = tree.join("rootfs");
         mkdir_private(&tree)?;
+        std::fs::create_dir(&rootfs)?;
         run(Command::new("tar")
-            .args(["-xzf"])
+            .arg("--zstd")
+            .arg("-xf")
             .arg(&archive)
             .arg("-C")
-            .arg(&tree)
+            .arg(&rootfs)
             .args(["--numeric-owner", "--xattrs", "--xattrs-include=*"]))
         .await
         .context("unpack")?;
-
-        let meta = std::fs::read_to_string(tree.join("metadata.yaml")).context("metadata.yaml")?;
-        let serial = yaml_value(&meta, "serial").context("image serial missing")?;
-        if serial.is_empty() || serial.contains(['/', '\0']) || serial.starts_with('.') {
-            bail!("invalid image serial {serial:?}");
-        }
-        let name = yaml_value(&meta, "description").unwrap_or_else(|| def.id.to_owned());
-        let img = Image {
-            id: def.id.to_owned(),
-            name,
-            serial: serial.clone(),
-            stop_signal: def.stop_signal.to_owned(),
+        let meta = Image {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            serial: e.serial.clone(),
+            stop_signal: e.stop_signal.clone(),
+            custom: false,
+            base: String::new(),
+            script: String::new(),
             rootfs: PathBuf::new(),
         };
+        std::fs::write(tree.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+        mkdir_private(serial_dir.parent().expect("serial dir has a parent"))?;
+        std::fs::rename(&tree, serial_dir)?;
+        let _ = tokio::fs::remove_file(&archive).await;
+        Ok(())
+    }
 
-        // The directory name ends up in overlayfs mount options, where ':'
-        // and ',' are separators, so keep it to a safe alphabet.
-        let dir_name: String = serial
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let serial_dir = image_dir.join(&dir_name);
-        if !serial_dir.exists() {
-            mkdir_private(&serial_dir)?;
-            std::fs::rename(tree.join("rootfs"), serial_dir.join("rootfs"))?;
-            std::fs::write(
-                serial_dir.join("meta.json"),
-                serde_json::to_vec_pretty(&img)?,
-            )?;
+    /// Install a finished custom image tree (`tree/rootfs`) as the current
+    /// version of `meta.id`.
+    pub fn install_custom(&self, tree: &Path, meta: &Image) -> Result<Image> {
+        let image_dir = self.dir.join(&meta.id);
+        mkdir_private(&image_dir)?;
+        std::fs::write(tree.join("meta.json"), serde_json::to_vec_pretty(meta)?)?;
+        let name = dir_name(&meta.serial);
+        std::fs::rename(tree, image_dir.join(&name))?;
+        replace_symlink(&name, &image_dir.join("current"))?;
+        self.get(&meta.id)
+    }
+
+    /// Stop offering a custom image; its files go once no instance uses them.
+    pub fn remove_custom(&self, id: &str) -> Result<()> {
+        let img = self.get(id)?;
+        if !img.custom {
+            bail!("{id} is an official image");
         }
-        replace_symlink(&dir_name, &image_dir.join("current"))?;
-        self.get(def.id)
+        std::fs::remove_file(self.dir.join(id).join("current"))?;
+        Ok(())
+    }
+
+    /// Delete serials that are neither current nor the lower layer of any
+    /// instance (`in_use` holds their rootfs paths).
+    pub fn gc(&self, in_use: &[PathBuf]) {
+        let Ok(ids) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for id_entry in ids.flatten() {
+            let id_dir = id_entry.path();
+            let name = id_entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".staging-") {
+                // Leftover of an interrupted download.
+                let _ = std::fs::remove_dir_all(&id_dir);
+                continue;
+            }
+            if !id_dir.is_dir() || !valid_id(&name) {
+                continue;
+            }
+            let current = std::fs::canonicalize(id_dir.join("current")).ok();
+            let Ok(serials) = std::fs::read_dir(&id_dir) else {
+                continue;
+            };
+            let mut kept = 0;
+            for s in serials.flatten() {
+                let path = s.path();
+                if s.file_name() == "current" || !path.is_dir() {
+                    continue;
+                }
+                let canonical = std::fs::canonicalize(&path).unwrap_or(path.clone());
+                let used = in_use
+                    .iter()
+                    .any(|p| p.starts_with(&canonical) || p.starts_with(&path));
+                if Some(&canonical) == current.as_ref() || used {
+                    kept += 1;
+                    continue;
+                }
+                info!(
+                    "removing unused image {name} {}",
+                    s.file_name().to_string_lossy()
+                );
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    warn!("remove {}: {e}", path.display());
+                }
+            }
+            if kept == 0 && current.is_none() {
+                let _ = std::fs::remove_dir_all(&id_dir);
+            }
+        }
     }
 }
 
-fn def(id: &str) -> Result<&'static ImageDef> {
-    IMAGES
-        .iter()
-        .find(|d| d.id == id)
-        .with_context(|| format!("unknown image {id:?}"))
-}
-
-/// First `key: value` occurrence in a simple YAML document (quotes stripped).
-fn yaml_value(doc: &str, key: &str) -> Option<String> {
-    doc.lines().find_map(|line| {
-        let rest = line.trim_start().strip_prefix(key)?.strip_prefix(':')?;
-        Some(rest.trim().trim_matches('"').to_owned())
-    })
+async fn fetch(url: &str, dest: &Path) -> Result<()> {
+    run(Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "--connect-timeout", "20", "-o"])
+        .arg(dest)
+        .arg(url))
+    .await
+    .with_context(|| format!("download {url}"))
 }
 
 pub(super) async fn run(cmd: &mut Command) -> Result<()> {
@@ -202,12 +331,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_incus_metadata() {
-        let doc = "architecture: amd64\nproperties:\n  description: Debian trixie amd64 (cloud) (20261012_05:24)\n  serial: \"20261012_05:24\"\n";
-        assert_eq!(yaml_value(doc, "serial").unwrap(), "20261012_05:24");
-        assert_eq!(
-            yaml_value(doc, "description").unwrap(),
-            "Debian trixie amd64 (cloud) (20261012_05:24)"
+    fn ids_and_dir_names() {
+        assert!(valid_id("debian"));
+        assert!(valid_id("custom-web-1"));
+        assert!(!valid_id("../etc"));
+        assert!(!valid_id("Debian"));
+        assert!(!valid_id("-x"));
+        assert_eq!(dir_name("20261012_05:24"), "20261012_05_24");
+    }
+
+    #[test]
+    fn gc_keeps_current_and_used() {
+        let root = std::env::temp_dir().join(format!("runman-img-gc-{}", uuid::Uuid::new_v4()));
+        let store = ImageStore::new(&root, "http://example.invalid").unwrap();
+        let mk = |id: &str, serial: &str| {
+            let d = store.dir.join(id).join(serial);
+            std::fs::create_dir_all(d.join("rootfs")).unwrap();
+            d
+        };
+        let old = mk("debian", "1");
+        let used = mk("debian", "2");
+        let cur = mk("debian", "3");
+        replace_symlink("3", &store.dir.join("debian").join("current")).unwrap();
+        let gone = mk("custom-x", "1");
+        store.gc(&[used.join("rootfs")]);
+        assert!(!old.exists(), "unused old serial is removed");
+        assert!(used.exists() && cur.exists());
+        assert!(
+            !gone.exists() && !store.dir.join("custom-x").exists(),
+            "removed custom image without current"
         );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -148,7 +148,11 @@ async fn agent_main() -> Result<()> {
                     {
                         tracing::warn!("apply local dedicated IPs: {e:#}");
                     }
-                    rt.images().sync().await;
+                    // Official images: at start, then every 6 hours.
+                    loop {
+                        rt.refresh_images().await;
+                        tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+                    }
                 });
             }
             {

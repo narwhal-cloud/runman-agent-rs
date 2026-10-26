@@ -115,7 +115,7 @@ fn mounts_mentioning(id: &VmId) -> usize {
 async fn instance_lifecycle() {
     let rt = Runtime::new(Options {
         data_dir: DATA.into(),
-        image_base_url: DEFAULT_IMAGE_BASE_URL.into(),
+        image_base_url: image_url(),
         tun: true,
         network: NetworkConfig {
             bridge: "rmtest0".into(),
@@ -131,7 +131,7 @@ async fn instance_lifecycle() {
     .unwrap()
     .with_helper(env!("CARGO_BIN_EXE_runman-agent").into());
     rt.init().await.expect("init");
-    rt.images().sync().await;
+    rt.refresh_images().await;
     let images: Vec<String> = rt.images().ready().into_iter().map(|i| i.id).collect();
     assert!(images.contains(&"debian".to_string()), "{images:?}");
     assert!(images.contains(&"alpine".to_string()), "{images:?}");
@@ -512,7 +512,7 @@ async fn side_runtime(name: &str, network: NetworkConfig) -> Runtime {
     }
     let rt = Runtime::new(Options {
         data_dir: data.into(),
-        image_base_url: DEFAULT_IMAGE_BASE_URL.into(),
+        image_base_url: image_url(),
         tun: true,
         network,
         traffic_reset_day: 1,
@@ -523,7 +523,7 @@ async fn side_runtime(name: &str, network: NetworkConfig) -> Runtime {
     for s in vms(&rt).await {
         rt.delete(&VmId::parse(&s.vm_id).unwrap()).await.unwrap();
     }
-    rt.images().sync().await;
+    rt.refresh_images().await;
     rt
 }
 
@@ -762,7 +762,12 @@ async fn wireguard_dedicated_ips() {
         assert_eq!(&seen, a, "outbound must leave from the dedicated address");
     }
     // Services can bind the dedicated address itself.
-    let listen = console_run(&rt, &id, &format!("timeout 2 python3 -c \"import socket; s=socket.socket(socket.AF_INET); s.bind(('{}', 8080)); print('bound')\" 2>&1 || true", addrs.iter().find(|a| !a.contains(':')).cloned().unwrap_or_else(|| "0.0.0.0".into()))).await;
+    let v4 = addrs
+        .iter()
+        .find(|a| !a.contains(':'))
+        .cloned()
+        .unwrap_or_else(|| "0.0.0.0".into());
+    let listen = console_run(&rt, &id, &format!("sh -c 'nc -l -s {v4} -p 8080 >/dev/null 2>&1 & p=$!; sleep 1; kill $p 2>/dev/null && echo bound || echo failed'")).await;
     assert_eq!(listen, "bound");
 
     if let Some(secs) = std::env::var("RUNMAN_TEST_HOLD_SECS")
@@ -789,7 +794,7 @@ async fn wireguard_dedicated_ips() {
     }
     let rt = Runtime::new(Options {
         data_dir: "/var/lib/runman-agent-testwg".into(),
-        image_base_url: DEFAULT_IMAGE_BASE_URL.into(),
+        image_base_url: image_url(),
         tun: true,
         network: NetworkConfig {
             bridge: "rmtestwg".into(),
@@ -929,4 +934,10 @@ async fn concurrent_creates_get_distinct_slots() {
     for id in &ids {
         rt.delete(id).await.unwrap();
     }
+}
+
+/// Image source for tests: `RUNMAN_TEST_IMAGE_URL` (e.g. a local build) or the
+/// published images.
+fn image_url() -> String {
+    std::env::var("RUNMAN_TEST_IMAGE_URL").unwrap_or_else(|_| DEFAULT_IMAGE_BASE_URL.into())
 }

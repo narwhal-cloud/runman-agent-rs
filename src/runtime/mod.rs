@@ -231,6 +231,20 @@ impl Runtime {
         &self.images
     }
 
+    /// Download new official image versions, then drop versions no instance
+    /// is built on.
+    pub async fn refresh_images(&self) {
+        if let Err(e) = self.images.sync().await {
+            warn!("image sync: {e:#}");
+        }
+        let _alloc = self.alloc.lock().unwrap();
+        let in_use: Vec<PathBuf> = self
+            .records()
+            .map(|r| r.into_iter().map(|r| r.lower).collect())
+            .unwrap_or_default();
+        self.images.gc(&in_use);
+    }
+
     /// Prepare host networking and start every instance that should be
     /// running (after boot or an agent upgrade).
     pub async fn init(&self) -> Result<()> {
@@ -789,12 +803,14 @@ impl Runtime {
             info!("create {id}: replacing existing instance");
             self.delete_locked(&spec.vm_id).await?;
         }
-        let image = self.images.get(&spec.os_image)?;
         // Choosing an index and writing the record that claims it must be one
         // step: creates of different instances run concurrently, and two of
         // them picking the same free index would share a veth name and
         // addresses. The slow part (disk, boot) runs outside the lock.
         let alloc = self.alloc.lock().unwrap();
+        // Under the same lock as image GC: the serial chosen here is claimed
+        // by the record below before GC can consider it unused.
+        let image = self.images.get(&spec.os_image)?;
         let idx = self.allocate_idx()?;
         let rec = Record {
             id: id.to_owned(),

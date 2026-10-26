@@ -11,7 +11,7 @@ pub const DEFAULT_PLATFORM_URL: &str = "https://hosting.fuckip.me:443";
 pub const DEFAULT_UPDATE_URL: &str =
     "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous";
 pub const DEFAULT_IMAGE_BASE_URL: &str =
-    "https://github.com/narwhal-cloud/images/releases/download/vm-latest";
+    "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/images";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]

@@ -26,7 +26,7 @@ jobs:
       - name: Installer
         run: |
           sudo apt-get install -y -qq shellcheck
-          shellcheck -S style install.sh
+          shellcheck -S style install.sh images/build.sh
           bash install.sh --help >/dev/null
 
   # Real containers on the runner VM: needs root, systemd and network.
