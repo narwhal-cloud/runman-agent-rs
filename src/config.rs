@@ -43,7 +43,7 @@ pub struct Config {
     pub web_password_hash: String,
     /// Local API of the rfw firewall, proxied under /rfw/api/.
     pub rfw_addr: String,
-    /// Release location holding `SHA256SUMS`, `SHA256SUMS.sig` and the
+    /// Release location holding `SHA256SUMS` and the
     /// `runman-agent-linux-<arch>` binaries.
     pub update_url: String,
     pub auto_update: bool,

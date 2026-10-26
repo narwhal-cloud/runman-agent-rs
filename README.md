@@ -18,7 +18,7 @@ Token 只由平台生成，agent 和安装器从不自行生成。
 - **WireGuard 独立 IP**：宿主机内核 WireGuard，独立 IPv4/IPv6 直接配在实例 `eth0` 上，出站、入站、监听都用它；私钥不进实例。
 - **管理面板**（`:8792`）：节点概览、实例操作、浏览器终端、rfw 防火墙规则、Token 轮换。
 - **自愈**：被其他工具清掉的 nftables 规则、被删除的实例网卡会自动恢复。
-- **自更新**：只接受签名与校验和都正确的发布。
+- **自更新**：从官方 GitHub Release 下载，只安装校验和正确且能运行的版本。
 
 ## 安装
 
@@ -54,29 +54,16 @@ bash install.sh --token '<平台下发的 Token>'      # 接入平台
 
 - `runman-agent-linux-amd64`、`runman-agent-linux-arm64`（静态 musl 二进制）
 - `install.sh`
-- `SHA256SUMS` 与 `SHA256SUMS.sig`（对 `SHA256SUMS` 的 ed25519 签名）
+- `SHA256SUMS`
 
-节点只安装能用**编译进二进制的公钥**验证签名、且校验和匹配的版本，发现新版后随机延迟 0–6 小时再应用，以免整批节点同时重启（面板里可立即更新）。没有内置公钥的构建（例如本地编译版本）不会自动更新。
+节点直接从官方 GitHub 仓库的 Release 下载，只安装与 `SHA256SUMS` 校验和匹配、能正常运行的版本，发现新版后随机延迟 0–6 小时再应用，以免整批节点同时重启（面板里可立即更新）。本地编译的版本不会自动更新。
 
-首次使用前生成签名密钥（私钥妥善保管，只放进仓库 secret）：
-
-```bash
-openssl genpkey -algorithm ed25519 -out update-signing-key.pem
-# 仓库 Settings → Secrets and variables → Actions：
-#   Secret   UPDATE_SIGNING_KEY = update-signing-key.pem 的完整内容
-#   Variable UPDATE_PUBKEY      = 下面这条命令的输出
-openssl pkey -in update-signing-key.pem -pubout -outform DER | tail -c 32 | base64
-```
-
-没配置这两项时，Release 和 Images 工作流仍会构建（用于检查），但会跳过发布并给出警告。
-
-更换密钥后，已部署的节点仍只信任旧公钥，需要用新版 `install.sh` 重新安装一次才能继续自动更新。
 
 ## 实例镜像
 
-官方镜像由本仓库自己构建，不依赖其他仓库或第三方现成镜像：`images/build.sh` 直接从 Debian 官方源（mmdebstrap，最小安装、不带推荐包和文档）和 Alpine 官方 minirootfs 构建根文件系统。`.github/workflows/images.yml` 每周一（以及 `images/` 有改动时）构建 amd64 和 arm64，生成 `images.json` 清单并用与自更新相同的密钥签名，发布到滚动更新的 `images` Release。
+官方镜像由本仓库自己构建，不依赖其他仓库或第三方现成镜像：`images/build.sh` 直接从 Debian 官方源（mmdebstrap，最小安装、不带推荐包和文档）和 Alpine 官方 minirootfs 构建根文件系统。`.github/workflows/images.yml` 每周一（以及 `images/` 有改动时）构建 amd64 和 arm64，生成 `images.json` 清单，发布到滚动更新的 `images` Release。
 
-节点启动时以及每 6 小时同步一次：验证清单签名和每个文件的 SHA-256，有新版本就下载并作为新实例的默认版本；已有实例继续使用它们创建时的版本，没有实例使用的旧版本会被自动删除。
+节点启动时以及每 6 小时同步一次：校验每个文件的大小和 SHA-256，有新版本就下载并作为新实例的默认版本；已有实例继续使用它们创建时的版本，没有实例使用的旧版本会被自动删除。
 
 | 镜像 | 压缩包 | 解压后 | 128 MB 实例开机后的内存 |
 |---|---|---|---|

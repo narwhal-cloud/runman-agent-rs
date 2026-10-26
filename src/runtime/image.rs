@@ -5,8 +5,7 @@
 //! symlink to the serial new instances use. Instances keep the serial they
 //! were created from; [`ImageStore::gc`] removes serials nobody uses.
 //!
-//! Official images come from `image_base_url`: `images.json` (signed as
-//! `images.json.sig` with the release key), listing per-arch
+//! Official images come from `image_base_url`: `images.json`, listing per-arch
 //! `rootfs-<id>-<arch>.tar.zst` with SHA-256 and size. They are built by
 //! `images/build.sh` in this repository. Custom images are built on the node
 //! (see `Runtime::build_image`) and stored the same way.
@@ -144,15 +143,6 @@ impl ImageStore {
         let manifest_path = staging.join("images.json");
         fetch(&format!("{}/images.json", self.base_url), &manifest_path).await?;
         let raw = std::fs::read(&manifest_path)?;
-        match crate::updater::signing_key() {
-            Some(key) => {
-                let sig_path = staging.join("images.json.sig");
-                fetch(&format!("{}/images.json.sig", self.base_url), &sig_path).await?;
-                crate::updater::verify_signature(key, &raw, &std::fs::read(&sig_path)?)
-                    .context("images.json signature")?;
-            }
-            None => warn!("this build has no signing key; image manifest is not signature-checked"),
-        }
         let manifest: Manifest = serde_json::from_slice(&raw).context("parse images.json")?;
         for entry in manifest.images.iter().filter(|e| e.arch == self.arch) {
             if !valid_id(&entry.id)

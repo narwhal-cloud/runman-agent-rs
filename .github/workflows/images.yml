@@ -1,5 +1,5 @@
 # Builds the official instance images from Debian/Alpine package sources and
-# publishes them, with a signed manifest, as the rolling "images" release that
+# publishes them, with an images.json manifest, as the rolling "images" release that
 # agents sync from (image_base_url).
 name: Images
 
@@ -43,31 +43,16 @@ jobs:
 
   publish:
     needs: build
-    # Agents reject an unsigned manifest; skip until the release key is set.
-    if: vars.UPDATE_PUBKEY != ''
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Manifest and signature
-        env:
-          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
-          UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
+      - name: Manifest
         run: |
-          if [ -z "$UPDATE_SIGNING_KEY" ] || [ -z "$UPDATE_PUBKEY" ]; then
-            echo "::error::UPDATE_SIGNING_KEY / UPDATE_PUBKEY are not configured; agents would reject an unsigned manifest"
-            exit 1
-          fi
           cd dist
           jq -s '{version: 1, images: .}' rootfs-*.json > images.json
-          umask 077
-          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
-          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/key.pem" -rawin -in images.json -out images.json.sig
-          rm -f "$RUNNER_TEMP/key.pem"
-          { printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00'; printf '%s' "$UPDATE_PUBKEY" | base64 -d; } > "$RUNNER_TEMP/pub.der"
-          openssl pkeyutl -verify -pubin -keyform DER -inkey "$RUNNER_TEMP/pub.der" -rawin -in images.json -sigfile images.json.sig
           jq -c '.images[] | {id, arch, serial, size}' images.json
       - name: Publish
         env:
@@ -76,6 +61,6 @@ jobs:
         run: |
           cd dist
           gh release delete images --yes --cleanup-tag 2>/dev/null || true
-          gh release create images images.json images.json.sig rootfs-*.tar.zst \
+          gh release create images images.json rootfs-*.tar.zst \
             --title "Instance images" --latest=false --target "${{ github.sha }}" \
             --notes "Instance root filesystems built by images/build.sh; agents sync them via images.json."

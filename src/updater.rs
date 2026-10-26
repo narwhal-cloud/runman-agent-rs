@@ -1,21 +1,18 @@
 //! Self-update from the release location (`update_url`).
 //!
-//! A release publishes `runman-agent-linux-<arch>`, `SHA256SUMS` and
-//! `SHA256SUMS.sig` (ed25519 over `SHA256SUMS`). An update is applied only
-//! when the signature verifies against the public key compiled into this
-//! binary (`RUNMAN_UPDATE_PUBKEY`, base64 of the raw 32-byte key, set by CI),
-//! the download matches its checksum, is an ELF for this architecture and
-//! runs `--version`. The new binary then atomically replaces the running one
-//! and the agent exits so systemd starts the new version; instances keep
-//! running. Builds without a key never self-update.
+//! A release publishes `runman-agent-linux-<arch>` and `SHA256SUMS` on the
+//! official GitHub repository. An update is applied only when the download
+//! matches its checksum, is an ELF for this architecture and runs
+//! `--version`. The new binary then atomically replaces the running one and
+//! the agent exits so systemd starts the new version; instances keep
+//! running. Only CI release builds (`RUNMAN_BUILD_ID` set) self-update, so a
+//! locally built binary is never replaced behind its developer's back.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::Rng;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -25,13 +22,9 @@ use tracing::{info, warn};
 
 use crate::config;
 
-const PUBKEY: Option<&str> = option_env!("RUNMAN_UPDATE_PUBKEY");
+/// Set by CI for release builds.
+const BUILD_ID: Option<&str> = option_env!("RUNMAN_BUILD_ID");
 
-/// The release signing key compiled into this build, if any (also verifies
-/// the image manifest).
-pub fn signing_key() -> Option<&'static str> {
-    PUBKEY
-}
 const FIRST_CHECK: Duration = Duration::from_secs(600);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 /// Upper bound of the random delay before applying a found update, so a
@@ -40,7 +33,7 @@ const MAX_JITTER: Duration = Duration::from_secs(6 * 3600);
 
 /// Version string: crate version plus the CI build id when present.
 pub fn version() -> &'static str {
-    match option_env!("RUNMAN_BUILD_ID") {
+    match BUILD_ID {
         Some(id) => Box::leak(format!("{}+{id}", env!("CARGO_PKG_VERSION")).into_boxed_str()),
         None => env!("CARGO_PKG_VERSION"),
     }
@@ -56,7 +49,8 @@ pub fn asset_name() -> Result<&'static str> {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Status {
-    pub signing_key: bool,
+    /// A CI release build, which can update itself.
+    pub release_build: bool,
     pub auto_update: bool,
     pub last_check: Option<u64>,
     pub last_error: String,
@@ -92,15 +86,15 @@ impl Updater {
 
     pub fn status(&self) -> Status {
         let mut s = self.status.lock().unwrap().clone();
-        s.signing_key = PUBKEY.is_some();
+        s.release_build = BUILD_ID.is_some();
         s.auto_update = self.cfg.get().auto_update;
         s
     }
 
     /// Periodic checks; a found update is applied after a random delay.
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
-        if PUBKEY.is_none() {
-            warn!("self-update disabled: this build has no update signing key");
+        if BUILD_ID.is_none() {
+            info!("self-update disabled: not a release build");
             return;
         }
         let mut wait = FIRST_CHECK;
@@ -133,7 +127,7 @@ impl Updater {
         }
     }
 
-    /// Check and, if there is a newer signed release, install it and request
+    /// Check and, if there is a newer release, install it and request
     /// a restart.
     pub async fn update_now(&self) -> Result<Outcome> {
         let result = self.update_inner().await;
@@ -200,45 +194,25 @@ impl Updater {
         self.cfg.get().update_url.trim_end_matches('/').to_owned()
     }
 
-    /// SHA-256 of the release binary for this architecture if it is signed
-    /// and differs from the running one.
+    /// SHA-256 of the release binary for this architecture if it differs
+    /// from the running one.
     async fn newer_release(&self) -> Result<Option<String>> {
-        let key = PUBKEY.context("this build has no update signing key")?;
+        if BUILD_ID.is_none() {
+            bail!("not a release build; install a release to update");
+        }
         let dir = tempdir()?;
         let sums_path = dir.join("SHA256SUMS");
-        let sig_path = dir.join("SHA256SUMS.sig");
-        let base = self.base();
         let fetched = async {
-            fetch(&format!("{base}/SHA256SUMS"), &sums_path).await?;
-            fetch(&format!("{base}/SHA256SUMS.sig"), &sig_path).await?;
-            Ok::<_, anyhow::Error>((
-                tokio::fs::read(&sums_path).await?,
-                tokio::fs::read(&sig_path).await?,
-            ))
+            fetch(&format!("{}/SHA256SUMS", self.base()), &sums_path).await?;
+            Ok::<_, anyhow::Error>(tokio::fs::read(&sums_path).await?)
         }
         .await;
         let _ = tokio::fs::remove_dir_all(&dir).await;
-        let (sums, sig) = fetched?;
-        verify_signature(key, &sums, &sig)?;
+        let sums = fetched?;
         let want = expected_sha(&String::from_utf8_lossy(&sums), asset_name()?)?;
         let current = hex_sha256(&tokio::fs::read(&self.exe).await?);
         Ok((current != want).then_some(want))
     }
-}
-
-pub fn verify_signature(pubkey_b64: &str, message: &[u8], signature: &[u8]) -> Result<()> {
-    let engine = base64::engine::general_purpose::STANDARD;
-    let key: [u8; 32] = engine
-        .decode(pubkey_b64.trim())
-        .ok()
-        .and_then(|k| k.try_into().ok())
-        .context("invalid compiled-in update key")?;
-    let key = VerifyingKey::from_bytes(&key).context("invalid compiled-in update key")?;
-    let sig: [u8; 64] = signature
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("SHA256SUMS.sig must be 64 raw bytes"))?;
-    key.verify(message, &Signature::from_bytes(&sig))
-        .context("SHA256SUMS signature does not verify")
 }
 
 /// The checksum listed for `asset` (`sha256sum` format).
@@ -317,24 +291,14 @@ async fn fetch(url: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
-    fn signature_and_checksums() {
-        let sk = SigningKey::from_bytes(&[7u8; 32]);
-        let pk = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+    fn checksums() {
         let sums = format!(
             "{}  runman-agent-linux-amd64\n{}  runman-agent-linux-arm64\n",
             "a".repeat(64),
             "B".repeat(64)
         );
-        let sig = sk.sign(sums.as_bytes()).to_bytes();
-        verify_signature(&pk, sums.as_bytes(), &sig).unwrap();
-        let mut tampered = sums.clone().into_bytes();
-        tampered[0] = b'c';
-        assert!(verify_signature(&pk, &tampered, &sig).is_err());
-        assert!(verify_signature(&pk, sums.as_bytes(), &sig[..63]).is_err());
-
         assert_eq!(
             expected_sha(&sums, "runman-agent-linux-arm64").unwrap(),
             "b".repeat(64)

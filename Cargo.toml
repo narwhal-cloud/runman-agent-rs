@@ -16,9 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.102"
 axum = { version = "0.8.9", features = ["ws"] }
-base64 = "0.22.1"
 bcrypt = "0.19.3"
-ed25519-dalek = "2.2.0"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 async-trait = "0.1.88"

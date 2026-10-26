@@ -196,7 +196,7 @@ async function loadOverview() {
 
 function updateInfo(u) {
   if (!u) return '';
-  if (!u.signing_key) return '<div class="muted">此构建未内置签名公钥，不会自动更新</div>';
+  if (!u.release_build) return '<div class="muted">本地构建版本，不会自动更新</div>';
   const when = u.last_check ? new Date(u.last_check * 1000).toLocaleString() : '尚未检查';
   return `<div class="muted">${u.auto_update ? '自动更新已开启' : '自动更新已关闭'} · 上次检查 ${esc(when)}</div>`
     + (u.pending ? '<div><span class="badge warn">有新版本待安装</span></div>' : '')

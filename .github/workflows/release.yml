@@ -1,12 +1,7 @@
-# Builds static binaries and publishes them with a signed checksum list.
+# Builds static binaries and publishes them with a checksum list.
 #
 # - push to main  -> pre-release "continuous" (what nodes follow by default)
 # - tag v*        -> release with that tag
-#
-# Repository configuration (see README "Releases and self-update"):
-# - variable UPDATE_PUBKEY:      base64 of the raw 32-byte ed25519 public key,
-#                                compiled into the binaries
-# - secret   UPDATE_SIGNING_KEY: the matching private key (PEM)
 name: Release
 
 on:
@@ -42,12 +37,8 @@ jobs:
           key: ${{ matrix.target }}
       - name: Install cargo-zigbuild
         run: pip3 install --break-system-packages ziglang cargo-zigbuild
-      - name: Check signing key variable
-        if: vars.UPDATE_PUBKEY == ''
-        run: echo "::warning::repository variable UPDATE_PUBKEY is not set; building without a release key and not publishing"
       - name: Build
         env:
-          RUNMAN_UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
           RUNMAN_BUILD_ID: ${{ github.ref_type == 'tag' && github.ref_name || format('g{0}', github.sha) }}
         run: |
           RUNMAN_BUILD_ID="${RUNMAN_BUILD_ID:0:12}"
@@ -63,8 +54,6 @@ jobs:
 
   publish:
     needs: build
-    # Without the release key, agents could not verify what we publish.
-    if: vars.UPDATE_PUBKEY != ''
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -72,30 +61,19 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Checksums and signature
-        env:
-          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
-          UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
+      - name: Checksums
         run: |
           cp install.sh dist/
           cd dist
           chmod 755 runman-agent-linux-*
           sha256sum runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh > SHA256SUMS
-          umask 077
-          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
-          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/key.pem" -rawin -in SHA256SUMS -out SHA256SUMS.sig
-          rm -f "$RUNNER_TEMP/key.pem"
-          # The published signature must verify against the compiled-in key
-          # (raw ed25519 key wrapped into a DER SubjectPublicKeyInfo).
-          { printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00'; printf '%s' "$UPDATE_PUBKEY" | base64 -d; } > "$RUNNER_TEMP/pub.der"
-          openssl pkeyutl -verify -pubin -keyform DER -inkey "$RUNNER_TEMP/pub.der" -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
           ls -l
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
-          files=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh SHA256SUMS SHA256SUMS.sig)
+          files=(runman-agent-linux-amd64 runman-agent-linux-arm64 install.sh SHA256SUMS)
           if [ "${{ github.ref_type }}" = tag ]; then
             gh release create "${{ github.ref_name }}" "${files[@]}" --title "${{ github.ref_name }}" --generate-notes
           else
