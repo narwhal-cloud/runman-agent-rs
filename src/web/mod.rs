@@ -144,6 +144,7 @@ impl Web {
             .route("/api/settings", get(get_settings).put(put_settings))
             .route("/api/settings/token", post(set_token))
             .route("/api/settings/password", post(change_password))
+            .route("/api/speedtest", post(run_speedtest))
             .route("/api/rfw/status", get(rfw_status))
             .route("/api/update", post(update_now))
             .route("/rfw/api/{*rest}", any(rfw_proxy))
@@ -827,7 +828,28 @@ async fn get_settings(State(web): State<Arc<Web>>) -> Json<Value> {
         "web_user": c.web_user,
         "token_hint": token_hint,
         "traffic": traffic_info(&c),
+        "bandwidth": bandwidth_info(&web, &c),
     }))
+}
+
+/// Measured, configured and reported uplink bandwidth.
+fn bandwidth_info(web: &Web, c: &config::Config) -> Value {
+    let measured = web.agent.speed.measured_mbps();
+    json!({
+        "speedtest": web.agent.speed.status(),
+        "configured": c.bandwidth_mbps,
+        "reported": web.agent.bandwidth_mbps(c),
+        "max": measured.saturating_mul(crate::speedtest::MAX_CORRECTION),
+    })
+}
+
+async fn run_speedtest(State(web): State<Arc<Web>>) -> ApiResult<Json<Value>> {
+    web.agent
+        .speed
+        .run()
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    Ok(Json(bandwidth_info(&web, &web.cfg().get())))
 }
 
 #[derive(Deserialize)]
@@ -848,6 +870,10 @@ async fn put_settings(
                 .any(|c| c.is_whitespace() || c.is_control() || c == '/'))
     {
         return Err(err(StatusCode::BAD_REQUEST, "invalid host"));
+    }
+    if let Some(b) = req.bandwidth_mbps {
+        crate::speedtest::check_correction(web.agent.speed.measured_mbps(), b)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     }
     if let Some(d) = req.traffic_reset_day
         && !(1..=28).contains(&d)

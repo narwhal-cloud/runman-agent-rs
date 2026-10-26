@@ -122,6 +122,28 @@ async function refreshNode() {
   return o;
 }
 
+// ── bandwidth ──
+function bandwidthCard(b) {
+  const t = b.speedtest, m = t.measured;
+  const measured = m
+    ? `下行 ${m.down_mbps} Mbps · 上行 ${m.up_mbps} Mbps <span class="muted">（${new Date(m.at * 1000).toLocaleString()}）</span>`
+    : '<span class="muted">尚未测速</span>';
+  return `
+    <div class="kv">
+      <span class="muted">测速结果</span><span>${measured}</span>
+      <span class="muted">上报平台</span><span><strong>${b.reported ? b.reported + ' Mbps' : '未知'}</strong>
+        <span class="muted">${b.configured ? '（已手动修正）' : m ? '（取上下行中较小的一个）' : ''}</span></span>
+    </div>
+    ${t.last_error ? `<p class="muted">上次测速失败：${esc(t.last_error)}</p>` : ''}
+    <form class="row section" id="bandwidth-form">
+      <label>修正为（Mbps，0 = 使用测速结果）<input name="bandwidth_mbps" type="number" min="0" ${b.max ? `max="${b.max}"` : ''} value="${esc(b.configured)}" style="width:140px"></label>
+      <button class="btn primary">保存</button>
+      <button class="btn" type="button" id="speedtest-run"${t.running ? ' disabled' : ''}>${t.running ? '测速中…' : '重新测速'}</button>
+    </form>
+    <p class="muted">平台用这个带宽限制此节点上可售套餐的带宽上限。节点每周自动向 Cloudflare 测速一次（8 路并发，每个方向两轮取较好的一轮，最多约 800 MB 流量），取上下行中较小的值。
+      测速受线路和距离影响可能偏低，可以手动修正：可以填任意更低的值，最高为测速结果的 2 倍${b.max ? `（当前最高 ${b.max} Mbps）` : ''}。</p>`;
+}
+
 // ── traffic schedule ──
 const TIMEZONES = [
   ['-08:00', '美西'], ['-05:00', '美东'], ['+00:00', 'UTC / 伦敦'], ['+01:00', '欧洲中部'],
@@ -218,6 +240,13 @@ function updateInfo(u) {
     + (u.last_error ? `<div class="muted">${esc(u.last_error)}</div>` : '')
     + '<button class="btn" id="update-now" style="margin-top:6px">检查并更新</button>';
 }
+$('#tab-settings').addEventListener('click', async e => {
+  if (e.target.id !== 'speedtest-run') return;
+  e.target.disabled = true; e.target.textContent = '测速中，最长约 1 分钟…';
+  try { const b = await api('/api/speedtest', { method: 'POST' }); toast(`测速完成：上报 ${b.reported} Mbps`); }
+  catch (err) { toast('测速失败：' + err.message); }
+  loadSettings();
+});
 $('#tab-overview').addEventListener('click', async e => {
   if (e.target.id !== 'update-now') return;
   e.target.disabled = true;
@@ -617,10 +646,10 @@ async function loadSettings() {
       <div class="card section"><h2>节点信息</h2>
         <form class="row" id="settings-form">
           <label>入口地址（留空自动检测）<input name="host" value="${esc(s.host)}" placeholder="IP 或域名"></label>
-          <label>上行带宽（Mbps）<input name="bandwidth_mbps" type="number" min="0" value="${esc(s.bandwidth_mbps)}" style="width:120px"></label>
           <button class="btn primary">保存</button>
         </form>
       </div>
+      <div class="card section"><h2>节点带宽</h2>${bandwidthCard(s.bandwidth)}</div>
       <div class="card section"><h2>流量统计</h2>
         <form class="row" id="traffic-form">
           <label>每月重置日<select name="traffic_reset_day">${Array.from({ length: 28 }, (_, i) => i + 1).map(d => `<option value="${d}"${d === s.traffic.reset_day ? ' selected' : ''}>${d} 号</option>`).join('')}</select></label>
@@ -665,8 +694,11 @@ $('#tab-settings').addEventListener('submit', async e => {
       }
       toast('已接入平台，正在连接…');
     } else if (e.target.id === 'settings-form') {
-      await api('/api/settings', { method: 'PUT', body: { host: f.get('host').trim(), bandwidth_mbps: +f.get('bandwidth_mbps') } });
+      await api('/api/settings', { method: 'PUT', body: { host: f.get('host').trim() } });
       toast('已保存');
+    } else if (e.target.id === 'bandwidth-form') {
+      await api('/api/settings', { method: 'PUT', body: { bandwidth_mbps: +f.get('bandwidth_mbps') } });
+      toast('带宽已保存');
     } else if (e.target.id === 'traffic-form') {
       await api('/api/settings', { method: 'PUT', body: { traffic_reset_day: +f.get('traffic_reset_day'), traffic_timezone: f.get('traffic_timezone') } });
       toast('流量重置设置已保存');

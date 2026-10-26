@@ -57,6 +57,7 @@ async fn start_with_token(token: &str) -> Panel {
         web_password_hash: bcrypt::hash(PASSWORD, 4).unwrap(),
         token: token.into(),
         rfw_addr: rfw.to_string(),
+        data_dir: std::env::temp_dir().join(format!("runman-web-data-{}", uuid::Uuid::new_v4())),
         ..Config::default()
     };
     let store = Store::in_memory(cfg);
@@ -711,4 +712,31 @@ async fn traffic_schedule_settings() {
     assert!(next > now && next - now <= 31 * 86_400);
     // Midnight in UTC+8 is 16:00 UTC.
     assert_eq!(next % 86_400, 16 * 3600);
+}
+
+#[tokio::test]
+async fn bandwidth_correction() {
+    let p = start().await;
+    let c = client();
+    login(&p, &c, PASSWORD).await;
+    // Nothing measured yet: the owner's value is reported as is.
+    let r = c
+        .put(format!("{}/api/settings", p.base))
+        .header("X-Runman", "1")
+        .json(&json!({"bandwidth_mbps": 5000}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let s: Value = c
+        .get(format!("{}/api/settings", p.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["bandwidth"]["configured"], 5000);
+    assert_eq!(s["bandwidth"]["reported"], 5000);
+    assert!(s["bandwidth"]["speedtest"]["measured"].is_null());
 }

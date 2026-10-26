@@ -36,7 +36,8 @@ pub struct Config {
     pub traffic_reset_day: u32,
     /// UTC offset (`+08:00`) whose midnight starts the reset day.
     pub traffic_timezone: String,
-    /// Uplink bandwidth reported to the platform (Mbit/s, 0 = unknown).
+    /// Correction of the measured uplink bandwidth reported to the platform
+    /// (Mbit/s; 0 = report the speed test, see `speedtest`).
     pub bandwidth_mbps: u32,
     /// Management panel; empty `web_listen` disables it.
     pub web_listen: String,

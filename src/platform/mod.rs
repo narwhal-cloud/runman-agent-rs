@@ -119,12 +119,16 @@ pub struct Agent {
     pub entry: RwLock<EntryAddrs>,
     /// Wakes the session loop to reconnect at once (e.g. new token).
     reconnect: tokio::sync::Notify,
+    /// Uplink measurement behind the reported bandwidth.
+    pub speed: Arc<crate::speedtest::SpeedTest>,
 }
 
 impl Agent {
     pub fn new(cfg: Arc<config::Store>, services: Services, timing: Timing) -> Arc<Self> {
         let link = Link::default();
+        let speed = Arc::new(crate::speedtest::SpeedTest::load(&cfg.get().data_dir));
         Arc::new(Self {
+            speed,
             commands: CommandRunner::new(services.clone(), link.clone()),
             cfg,
             services,
@@ -134,6 +138,12 @@ impl Agent {
             entry: RwLock::default(),
             reconnect: tokio::sync::Notify::new(),
         })
+    }
+
+    /// Bandwidth reported to the platform: the speed test, or the owner's
+    /// correction of it.
+    pub fn bandwidth_mbps(&self, cfg: &config::Config) -> u32 {
+        crate::speedtest::effective(self.speed.measured_mbps(), cfg.bandwidth_mbps)
     }
 
     pub fn config(&self) -> &Arc<config::Store> {
@@ -364,6 +374,7 @@ impl Agent {
         let vms = self.services.instances.list().await?;
         let os_images = self.services.instances.images().await?;
         let cfg = self.cfg.get();
+        let bandwidth_mbps = self.bandwidth_mbps(&cfg) as i32;
         let entry = self.entry.read().unwrap().clone();
         Ok(proto::Heartbeat {
             timestamp: SystemTime::now()
@@ -390,11 +401,7 @@ impl Agent {
             cpus: host.cpus,
             ram_total_mb: host.ram_total_mb,
             disk_total_gb: host.disk_total_gb,
-            bandwidth_mbps: if host.bandwidth_mbps > 0 {
-                host.bandwidth_mbps
-            } else {
-                cfg.bandwidth_mbps as i32
-            },
+            bandwidth_mbps,
             virt_type: cfg.virt_label,
         })
     }

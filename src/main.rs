@@ -47,6 +47,9 @@ enum Command {
     },
     /// Probe the host and print suggested IPv6 settings for `[network]`.
     DetectIpv6,
+    /// Measure the uplink bandwidth now and save it (the agent also tests
+    /// weekly; restart it to report a result measured here).
+    Speedtest,
 }
 
 fn main() -> Result<()> {
@@ -101,6 +104,17 @@ async fn agent_main() -> Result<()> {
             return Ok(());
         }
         Some(Command::DetectIpv6) => unreachable!("handled above"),
+        Some(Command::Speedtest) => {
+            let speed = runman_agent::speedtest::SpeedTest::load(&store.get().data_dir);
+            let m = speed.run().await?;
+            println!(
+                "download {} Mbps, upload {} Mbps -> {} Mbps",
+                m.down_mbps,
+                m.up_mbps,
+                m.mbps()
+            );
+            return Ok(());
+        }
         Some(Command::SetToken { token, clear }) => {
             let token = if clear {
                 String::new()
@@ -183,6 +197,10 @@ async fn agent_main() -> Result<()> {
     let updater = Updater::new(store, shutdown.clone())?;
     tokio::spawn(updater.clone().run(shutdown.clone()));
     tokio::spawn(agent.clone().entry_loop(shutdown.clone()));
+    if cfg.backend != BackendKind::Fake {
+        let (speed, stop) = (agent.speed.clone(), shutdown.clone());
+        tokio::spawn(async move { speed.schedule(stop).await });
+    }
     if !cfg.web_listen.is_empty() {
         let web = Web::new(
             agent.clone(),

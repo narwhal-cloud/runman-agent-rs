@@ -51,7 +51,8 @@ Usage: install.sh [options]
   --ipv6-prefix CIDR      Prefix for --ipv6 subnet, e.g. 2001:db8:1:2::/64
   --ipv6-uplink IFACE     Interface where that prefix is on-link (NDP proxy);
                           omit when the prefix is routed to this host
-  --bandwidth MBPS        Uplink bandwidth reported to the platform
+  --bandwidth MBPS        Correct the measured uplink bandwidth reported to the
+                          platform (default: report the speed test)
   --no-rfw                Do not install the rfw firewall
   --rfw-iface IFACE       Interface rfw protects (default: IPv4 default route)
   --from-dir DIR          Use binaries from DIR (runman-agent-linux-<arch>, SHA256SUMS,
