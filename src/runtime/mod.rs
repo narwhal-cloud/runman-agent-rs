@@ -129,6 +129,8 @@ pub struct Runtime {
     /// Serializes operations on one instance (platform commands and WG sync
     /// both touch an instance's rootfs and unit).
     vm_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes instance index allocation (see `create_locked`).
+    alloc: Mutex<()>,
 }
 
 impl Runtime {
@@ -166,6 +168,7 @@ impl Runtime {
             dedicated: Mutex::new(dedicated),
             net_pending: Mutex::default(),
             vm_locks: Mutex::default(),
+            alloc: Mutex::default(),
         })
     }
 
@@ -787,6 +790,11 @@ impl Runtime {
             self.delete_locked(&spec.vm_id).await?;
         }
         let image = self.images.get(&spec.os_image)?;
+        // Choosing an index and writing the record that claims it must be one
+        // step: creates of different instances run concurrently, and two of
+        // them picking the same free index would share a veth name and
+        // addresses. The slow part (disk, boot) runs outside the lock.
+        let alloc = self.alloc.lock().unwrap();
         let idx = self.allocate_idx()?;
         let rec = Record {
             id: id.to_owned(),
@@ -802,12 +810,14 @@ impl Runtime {
             addrs: self.net.addrs_for(idx)?,
             desired: Desired::Running,
         };
+        mkdir_private(&self.dir(id))?;
+        self.save(&rec)?;
+        drop(alloc);
         let started = Instant::now();
         if let Err(e) = self.provision(&rec, &spec.root_password).await {
             let _ = std::fs::remove_dir_all(self.dir(id));
             return Err(e.context("provision instance"));
         }
-        self.save(&rec)?;
         self.reconcile_network().await?;
         self.launch(&rec).await?;
         info!(

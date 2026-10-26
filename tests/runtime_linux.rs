@@ -837,3 +837,67 @@ async fn check_dedicated(rt: &Runtime, id: &VmId, addrs: &[String], when: &str) 
         assert_eq!(&seen, a, "{when} ({flag})");
     }
 }
+
+/// The platform often provisions several instances at once.
+#[tokio::test]
+#[ignore = "needs root, systemd and network"]
+async fn concurrent_creates_get_distinct_slots() {
+    let rt = std::sync::Arc::new(
+        side_runtime(
+            "testcc",
+            NetworkConfig {
+                bridge: "rmtestcc".into(),
+                ipv4_subnet: "10.97.0.0/20".into(),
+                veth_prefix: "cv".into(),
+                wg_prefix: "cw".into(),
+                nft_table: "runman_c".into(),
+                wg_table_base: 25000,
+                ..Default::default()
+            },
+        )
+        .await,
+    );
+    let ids: Vec<VmId> = (0..4)
+        .map(|_| VmId::parse(&uuid::Uuid::new_v4().to_string()).unwrap())
+        .collect();
+    let tasks: Vec<_> = ids
+        .iter()
+        .enumerate()
+        .map(|(n, id)| {
+            let rt = rt.clone();
+            let spec = spec(
+                id,
+                if n % 2 == 0 { "debian" } else { "alpine" },
+                "Conc-pass-1",
+            );
+            tokio::spawn(async move { rt.create(&spec).await })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap().expect("concurrent create");
+    }
+    let list = vms(&rt).await;
+    let mut ips: Vec<String> = list.iter().map(|s| s.ips[0].clone()).collect();
+    ips.sort();
+    ips.dedup();
+    assert_eq!(
+        ips.len(),
+        4,
+        "every instance needs its own address: {ips:?}"
+    );
+    for id in &ids {
+        let out = wait_for(&rt, id, "ip -4 -o addr show dev eth0 | wc -l", |s| s == "1").await;
+        assert_eq!(out, "1", "{id} lost its network");
+        let web = wait_for(
+            &rt,
+            id,
+            "wget -q -O /dev/null https://www.cloudflare.com/ && echo ok || echo fail",
+            |s| s == "ok",
+        )
+        .await;
+        assert_eq!(web, "ok", "{id} has no outbound access");
+    }
+    for id in &ids {
+        rt.delete(id).await.unwrap();
+    }
+}
