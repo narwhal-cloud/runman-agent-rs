@@ -14,7 +14,34 @@ const MASKED_UNITS: &[&str] = &[
     "sys-kernel-tracing.mount",
     "sys-fs-fuse-connections.mount",
     "systemd-journald-audit.socket",
+    // Not useful in an instance; the console is reached through exec and the
+    // clock is the host's.
+    "console-getty.service",
+    "systemd-timesyncd.service",
 ];
+
+/// Services and timers that cost memory small plans cannot spare (measured
+/// on a 128 MB Debian 13 instance: 35 MB in use, exim4 alone 14 MB). The
+/// periodic jobs are idle most of the time but `apt update` and friends
+/// briefly need tens of MB, enough to OOM a 128 MB instance. Users can
+/// unmask anything they want back (`systemctl unmask ...`).
+const MEMORY_HEAVY_UNITS: &[&str] = &[
+    "exim4.service",
+    "exim4-base.timer",
+    "systemd-resolved.service",
+    "apt-daily.timer",
+    "apt-daily-upgrade.timer",
+    "man-db.timer",
+    "e2scrub_all.timer",
+    "e2scrub_reap.service",
+    "fstrim.timer",
+    "dpkg-db-backup.timer",
+    "motd-news.timer",
+];
+
+/// journald keeps its runtime journal on /run (tmpfs, charged to the
+/// instance's memory); cap it.
+const JOURNALD_DROPIN: &str = "[Journal]\nRuntimeMaxUse=8M\nSystemMaxUse=64M\n";
 
 const SSH_HOST_KEYS: &[&str] = &["rsa", "ecdsa", "ed25519", "dsa"];
 
@@ -74,7 +101,13 @@ pub fn prepare(root: &RootFs, cfg: &FirstBoot<'_>) -> Result<()> {
                 0o644,
             )?;
         }
-        for unit in MASKED_UNITS {
+        root.mkdir_all("/etc/systemd/journald.conf.d")?;
+        root.write(
+            "/etc/systemd/journald.conf.d/10-runman.conf",
+            JOURNALD_DROPIN.as_bytes(),
+            0o644,
+        )?;
+        for unit in MASKED_UNITS.iter().chain(MEMORY_HEAVY_UNITS) {
             root.symlink(&format!("/etc/systemd/system/{unit}"), "/dev/null")?;
         }
     }
@@ -98,6 +131,9 @@ pub fn write_network(root: &RootFs, n: &NetFiles) -> Result<()> {
         // Sorts before the image's DHCP config; networkd uses the first match.
         root.write(NETWORKD_FILE, networkd_file(n).as_bytes(), 0o644)?;
         root.remove("/etc/systemd/network/10-cloud-init-eth0.network")?;
+        // systemd-resolved is masked to save memory: point resolv.conf at
+        // the DNS servers directly (replaces the stub-resolver symlink).
+        root.write("/etc/resolv.conf", resolv_conf(n).as_bytes(), 0o644)?;
     } else {
         root.mkdir_all("/etc/network")?;
         root.write(
