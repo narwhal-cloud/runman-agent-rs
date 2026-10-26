@@ -146,7 +146,8 @@ rfw (独立进程, 127.0.0.1:7734)   eBPF/XDP 防火墙，由 agent 安装与反
 - **命令行**：`runman-agent set-password` 从 stdin 读密码；`runman-agent set-token <TOKEN>` 和 `runman-agent set-token --clear` 用于接入和断开平台，供安装器和运维使用。
 - **rfw**：独立的 systemd 服务，API 只监听 `127.0.0.1:7734`。面板把 `/rfw/api/*` 反向代理过去，同样受会话和 CSRF 保护，规则页由面板自己实现。rfw 自带的页面把 API 路径写死为 `/api/...`，不适合挂在子路径下，所以不代理它的页面。
   - 实测：通过面板添加「入站 tcp 某端口 拦截」后，对应的端口转发立即不可达，删除规则后恢复。
-  - WireGuard 独立 IP 的流量在隧道里是加密的，rfw 看不到。
+  - 匹配顺序（rfw 实现）：启用的规则按优先级数字从大到小逐条比对，第一条命中的规则生效；优先级相同时先创建的先比对；都没命中则放行；最多 64 条启用中的规则生效。面板防火墙页写明了这些规则。
+  - rfw 只处理 IPv4，IPv6 流量不经过它。WireGuard 独立 IP 的流量在隧道里是加密的，rfw 也看不到。
 - **公网入口 IP** 每 5 分钟通过 ip.sb 探测一次，写进心跳。带宽改为在配置里填写 `bandwidth_mbps`，不再每次启动都测速。
 - **开发工具** `examples/mock_platform.rs`：模拟平台，从 stdin 下发命令，打印心跳和回执。
 

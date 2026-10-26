@@ -418,7 +418,14 @@ async function loadFirewall() {
   try { rules = await api('/rfw/api/rules'); } catch (e) { toast(e.message); }
   const ipText = r => r.ip_type === 'geoip' ? 'GeoIP ' + (r.countries || []).join(',') : r.ip_type === 'cidr' ? r.ip : '任意';
   el.innerHTML = `
-    <p class="muted">网卡 <code>${esc(st.api.iface)}</code> · 规则按优先级从高到低匹配。注意：经 WireGuard 独立 IP 进出的流量在隧道内加密，rfw 看不到。</p>
+    <div class="card"><h2>匹配规则</h2>
+      <ul class="muted" style="margin:0;padding-left:18px">
+        <li>网卡 <code>${esc(st.api.iface)}</code>；启用的规则按<strong>优先级数字从大到小</strong>逐条比对，<strong>第一条命中的规则生效</strong>（拦截或放行），后面的不再检查。</li>
+        <li>优先级相同时，先创建的规则先比对；都没有命中则<strong>放行</strong>。</li>
+        <li>最多 64 条启用中的规则生效。例：想对某个地址放行、其余拦截，给「放行」规则更大的优先级。</li>
+        <li>只过滤 <strong>IPv4</strong>：IPv6 流量不经过 rfw。经 WireGuard 独立 IP 进出的流量在隧道内加密，rfw 也看不到。</li>
+      </ul></div>
+    <div class="section"></div>
     <div class="table-wrap"><table>
       <tr><th>优先级</th><th>方向</th><th>协议</th><th>端口</th><th>来源/目标</th><th>动作</th><th>状态</th><th></th></tr>
       ${rules.map(r => `<tr>
