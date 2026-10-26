@@ -75,7 +75,23 @@ pub async fn detect_ipv6() -> Result<Ipv6Plan> {
 /// Does traffic sourced from `addr` (inside our prefix) get out and back?
 async fn probe_source(uplink: &str, addr: Ipv6Addr) -> bool {
     let a = format!("{addr}/128");
-    if !run(&["ip", "-6", "addr", "add", &a, "dev", uplink, "nodad"]).await {
+    // preferred_lft 0 (deprecated): usable when bound explicitly, but never
+    // picked as the host's default source address, so the host's own IPv6
+    // keeps working while the probe runs.
+    if !run(&[
+        "ip",
+        "-6",
+        "addr",
+        "add",
+        &a,
+        "dev",
+        uplink,
+        "nodad",
+        "preferred_lft",
+        "0",
+    ])
+    .await
+    {
         return false;
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
