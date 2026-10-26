@@ -118,8 +118,23 @@ const node = { mode: 'standalone', images: [], entry: '' };
 async function refreshNode() {
   const o = await api('/api/overview');
   node.mode = o.mode; node.images = o.images; node.entry = o.entry.host || o.entry.ipv4 || location.hostname;
+  node.traffic = o.traffic;
   return o;
 }
+
+// ── traffic schedule ──
+const TIMEZONES = [
+  ['-08:00', '美西'], ['-05:00', '美东'], ['+00:00', 'UTC / 伦敦'], ['+01:00', '欧洲中部'],
+  ['+03:00', '莫斯科'], ['+05:30', '印度'], ['+07:00', '曼谷 / 雅加达'],
+  ['+08:00', '北京 / 香港 / 新加坡'], ['+09:00', '东京 / 首尔'], ['+10:00', '悉尼'],
+];
+const offsetMin = tz => { const m = /^([+-])(\d\d):(\d\d)$/.exec(tz) || []; return (m[1] === '-' ? -1 : 1) * ((+m[2] || 0) * 60 + (+m[3] || 0)); };
+// Wall-clock time of a unix timestamp at a UTC offset.
+function atOffset(unix, tz) {
+  const d = new Date((unix + offsetMin(tz) * 60) * 1000), p = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+const nextResetText = t => t ? `${atOffset(t.next_reset, t.timezone)}（UTC${t.timezone}）` : '-';
 const standalone = () => node.mode === 'standalone';
 const sshHint = port => port ? `ssh -p ${port} root@${node.entry}` : '（未分配 SSH 端口）';
 
@@ -244,7 +259,7 @@ async function loadInstances() {
       : '<p class="muted">此节点由平台管理：新建、删除、重装和端口转发请在平台上操作。</p>';
     if (!list.length) { el.innerHTML = head + '<p class="muted section">此节点上还没有实例。</p>'; return; }
     el.innerHTML = head + `<div class="table-wrap section"><table>
-      <tr><th>实例</th><th>状态</th><th>规格</th><th>地址</th><th>端口转发</th><th>本月流量</th><th>操作</th></tr>
+      <tr><th>实例</th><th>状态</th><th>规格</th><th>地址</th><th>端口转发</th><th title="下次重置：${esc(nextResetText(node.traffic))}">本月流量<div class="muted" style="font-weight:normal">${node.traffic ? esc(atOffset(node.traffic.next_reset, node.traffic.timezone).slice(5, 10)) + ' 重置' : ''}</div></th><th>操作</th></tr>
       ${list.map(i => `<tr data-id="${esc(i.id)}">
         <td><div>${esc(i.hostname || '-')}</div><div class="muted mono">${esc(i.id)}</div><div class="muted">${esc(i.os_image)}</div></td>
         <td><span class="badge ${esc(i.status)}">${esc({running:'运行中',stopped:'已停止',creating:'创建中',error:'异常'}[i.status] || i.status)}</span>
@@ -606,6 +621,17 @@ async function loadSettings() {
           <button class="btn primary">保存</button>
         </form>
       </div>
+      <div class="card section"><h2>流量统计</h2>
+        <form class="row" id="traffic-form">
+          <label>每月重置日<select name="traffic_reset_day">${Array.from({ length: 28 }, (_, i) => i + 1).map(d => `<option value="${d}"${d === s.traffic.reset_day ? ' selected' : ''}>${d} 号</option>`).join('')}</select></label>
+          <label>时区<select name="traffic_timezone">${(TIMEZONES.some(([z]) => z === s.traffic.timezone) ? TIMEZONES : [[s.traffic.timezone, '当前配置'], ...TIMEZONES])
+            .map(([z, n]) => `<option value="${z}"${z === s.traffic.timezone ? ' selected' : ''}>UTC${z} ${esc(n)}</option>`).join('')}</select></label>
+          <button class="btn primary">保存</button>
+        </form>
+        <div class="kv section"><span class="muted">下次重置</span><span>${esc(nextResetText(s.traffic))}</span></div>
+        <p class="muted">每个实例的「本月流量」在重置日当天 00:00（所选时区）归零，累计流量不受影响。整台节点使用同一个重置日；最多可选 28 号，保证每个月都有这一天。
+          平台按本月入站 + 出站之和判断是否超出套餐流量。修改设置不会清空当前周期已用的流量，它们会在新的重置时间到来时归零。</p>
+      </div>
       <div class="card section"><h2>面板密码</h2>
         <form class="row" id="password-form">
           <label>当前密码<input name="old_password" type="password" autocomplete="current-password" required></label>
@@ -641,6 +667,9 @@ $('#tab-settings').addEventListener('submit', async e => {
     } else if (e.target.id === 'settings-form') {
       await api('/api/settings', { method: 'PUT', body: { host: f.get('host').trim(), bandwidth_mbps: +f.get('bandwidth_mbps') } });
       toast('已保存');
+    } else if (e.target.id === 'traffic-form') {
+      await api('/api/settings', { method: 'PUT', body: { traffic_reset_day: +f.get('traffic_reset_day'), traffic_timezone: f.get('traffic_timezone') } });
+      toast('流量重置设置已保存');
     } else if (e.target.id === 'password-form') {
       await api('/api/settings/password', { method: 'POST', body: { old_password: f.get('old_password'), new_password: f.get('new_password') } });
       toast('密码已修改，其他会话已退出'); e.target.reset();

@@ -34,6 +34,8 @@ pub struct Config {
     pub tun: bool,
     /// Day of month (1-28) on which monthly traffic counters restart.
     pub traffic_reset_day: u32,
+    /// UTC offset (`+08:00`) whose midnight starts the reset day.
+    pub traffic_timezone: String,
     /// Uplink bandwidth reported to the platform (Mbit/s, 0 = unknown).
     pub bandwidth_mbps: u32,
     /// Management panel; empty `web_listen` disables it.
@@ -111,6 +113,7 @@ impl Default for Config {
             image_base_url: DEFAULT_IMAGE_BASE_URL.into(),
             tun: true,
             traffic_reset_day: 1,
+            traffic_timezone: "+00:00".into(),
             bandwidth_mbps: 0,
             web_listen: "0.0.0.0:8792".into(),
             web_user: "admin".into(),
@@ -144,11 +147,43 @@ impl Config {
         if !(1..=28).contains(&self.traffic_reset_day) {
             bail!("traffic_reset_day must be 1-28");
         }
+        parse_utc_offset(&self.traffic_timezone)?;
         if self.token.chars().any(char::is_control) {
             bail!("token must not contain control characters");
         }
         Ok(())
     }
+}
+
+impl Config {
+    /// When monthly traffic restarts.
+    pub fn traffic_schedule(&self) -> crate::traffic::Schedule {
+        crate::traffic::Schedule {
+            reset_day: self.traffic_reset_day,
+            utc_offset_min: parse_utc_offset(&self.traffic_timezone).unwrap_or(0),
+        }
+    }
+}
+
+/// `+08:00` / `-05:30` / `+00:00` to minutes east of UTC.
+pub fn parse_utc_offset(s: &str) -> Result<i32> {
+    let parsed = (|| {
+        let (sign, rest) = match s.as_bytes().first()? {
+            b'+' => (1, &s[1..]),
+            b'-' => (-1, &s[1..]),
+            _ => return None,
+        };
+        let (h, m) = rest.split_once(':')?;
+        if h.len() != 2 || m.len() != 2 {
+            return None;
+        }
+        let (h, m): (i32, i32) = (h.parse().ok()?, m.parse().ok()?);
+        let total = sign * (h * 60 + m);
+        (m < 60 && (-12 * 60..=14 * 60).contains(&total)).then_some(total)
+    })();
+    parsed.with_context(|| {
+        format!("traffic_timezone {s:?} must be a UTC offset like +08:00 (-12:00 to +14:00)")
+    })
 }
 
 /// Thread-safe configuration holder that persists updates atomically.
@@ -225,5 +260,19 @@ mod tests {
             toml::from_str(include_str!("../config.example.toml")).expect("parse example");
         assert_eq!(example, Config::default());
         example.validate().unwrap();
+    }
+
+    #[test]
+    fn utc_offsets() {
+        assert_eq!(parse_utc_offset("+00:00").unwrap(), 0);
+        assert_eq!(parse_utc_offset("+08:00").unwrap(), 480);
+        assert_eq!(parse_utc_offset("+05:30").unwrap(), 330);
+        assert_eq!(parse_utc_offset("-03:30").unwrap(), -210);
+        assert_eq!(parse_utc_offset("+14:00").unwrap(), 840);
+        for bad in [
+            "", "08:00", "+8:00", "+08", "+08:60", "-13:00", "+15:00", "UTC", "+0a:00",
+        ] {
+            assert!(parse_utc_offset(bad).is_err(), "{bad:?}");
+        }
     }
 }

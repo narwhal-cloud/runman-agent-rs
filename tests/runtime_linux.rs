@@ -126,7 +126,10 @@ async fn instance_lifecycle() {
             wg_table_base: 21000,
             ..Default::default()
         },
-        traffic_reset_day: 1,
+        traffic: runman_agent::traffic::Schedule {
+            reset_day: 1,
+            utc_offset_min: 0,
+        },
     })
     .unwrap()
     .with_helper(env!("CARGO_BIN_EXE_runman-agent").into());
@@ -515,7 +518,10 @@ async fn side_runtime(name: &str, network: NetworkConfig) -> Runtime {
         image_base_url: image_url(),
         tun: true,
         network,
-        traffic_reset_day: 1,
+        traffic: runman_agent::traffic::Schedule {
+            reset_day: 1,
+            utc_offset_min: 0,
+        },
     })
     .unwrap()
     .with_helper(env!("CARGO_BIN_EXE_runman-agent").into());
@@ -805,7 +811,10 @@ async fn wireguard_dedicated_ips() {
             wg_table_base: 24000,
             ..Default::default()
         },
-        traffic_reset_day: 1,
+        traffic: runman_agent::traffic::Schedule {
+            reset_day: 1,
+            utc_offset_min: 0,
+        },
     })
     .unwrap()
     .with_helper(env!("CARGO_BIN_EXE_runman-agent").into());

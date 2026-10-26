@@ -133,7 +133,7 @@ async fn agent_main() -> Result<()> {
         BackendKind::Container => anyhow::bail!("the container backend requires Linux"),
         #[cfg(target_os = "linux")]
         BackendKind::Container => {
-            let rt = Arc::new(Runtime::new(Options::from_config(&cfg))?);
+            let rt = Arc::new(Runtime::new(Options::from_config(&cfg))?.with_config(store.clone()));
             {
                 let rt = rt.clone();
                 let store_for_init = store.clone();

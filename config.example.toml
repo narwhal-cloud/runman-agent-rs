@@ -11,6 +11,7 @@ backend = "container"       # "fake" = in-memory, for development only
 image_base_url = "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/images"
 tun = true                  # expose /dev/net/tun to instances
 traffic_reset_day = 1       # day of month (1-28) monthly traffic starts again
+traffic_timezone = "+00:00" # UTC offset whose midnight starts that day, e.g. "+08:00"
 bandwidth_mbps = 0          # uplink bandwidth reported to the platform
 
 web_listen = "0.0.0.0:8792" # management panel; "" disables, 127.0.0.1:8792 = SSH tunnel only

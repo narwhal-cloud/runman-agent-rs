@@ -22,7 +22,6 @@ pub mod seccomp;
 pub mod spec;
 pub mod supervisor;
 pub mod sys;
-pub mod traffic;
 pub mod wg;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -40,15 +39,21 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::backend::{ConsoleIo, Instances, PortForwards, WgBindings};
-use crate::config::{Config, NetworkConfig};
+use crate::config::{self, Config, NetworkConfig};
 use crate::model::{ConsoleSize, InstanceDetails, InstanceSpec, L4Proto, PortForward, VmId};
 use crate::proto;
+use crate::traffic::{Schedule, Traffic};
 use exec::ExecTarget;
 use fsutil::{RootFs, mkdir_private};
 use image::{ImageStore, run};
 use net::{Addrs, Forward, Net, Port};
 use spec::{ID_BASE, ID_RANGE, NetSpec, RunSpec, unit_cgroup, unit_name};
-use traffic::{Traffic, period_key};
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 const RUN_ROOT: &str = "/run/runman-agent";
 const START_TIMEOUT: Duration = Duration::from_secs(15);
@@ -62,7 +67,7 @@ pub struct Options {
     pub image_base_url: String,
     pub tun: bool,
     pub network: NetworkConfig,
-    pub traffic_reset_day: u32,
+    pub traffic: Schedule,
 }
 
 impl Options {
@@ -72,7 +77,7 @@ impl Options {
             image_base_url: c.image_base_url.clone(),
             tun: c.tun,
             network: c.network.clone(),
-            traffic_reset_day: c.traffic_reset_day,
+            traffic: c.traffic_schedule(),
         }
     }
 }
@@ -121,7 +126,11 @@ pub struct Runtime {
     images: ImageStore,
     tun: bool,
     net: Net,
-    reset_day: u32,
+    /// Traffic schedule in effect; its lock also serializes `traffic.json`
+    /// writes against relabelling (see `traffic_schedule`).
+    schedule: Mutex<Schedule>,
+    /// Live configuration, for schedule changes made in the panel.
+    config: Option<Arc<config::Store>>,
     /// Port forwards; the lock also serializes ruleset updates.
     forwards: tokio::sync::Mutex<Vec<PortForward>>,
     cpu_samples: Mutex<HashMap<String, (Instant, u64)>>,
@@ -167,7 +176,8 @@ impl Runtime {
             images: ImageStore::new(data_dir, &opts.image_base_url)?,
             tun: opts.tun,
             net,
-            reset_day: opts.traffic_reset_day,
+            schedule: Mutex::new(opts.traffic),
+            config: None,
             forwards: tokio::sync::Mutex::new(forwards),
             cpu_samples: Mutex::default(),
             tunnels: tokio::sync::Mutex::new(tunnels),
@@ -226,6 +236,12 @@ impl Runtime {
             })
             .await
         }
+    }
+
+    /// Follow the traffic schedule of a live configuration.
+    pub fn with_config(mut self, store: Arc<config::Store>) -> Self {
+        self.config = Some(store);
+        self
     }
 
     /// Binary that provides `__supervise`/`__exec` (default: this executable).
@@ -680,11 +696,52 @@ impl Runtime {
         }
     }
 
+    /// The schedule in effect, switching to the configured one if it
+    /// changed. A change keeps the usage counted so far: counters of the
+    /// current period are relabelled to the new schedule's period, so they
+    /// restart at its next reset, not right away.
+    fn traffic_schedule(&self) -> std::sync::MutexGuard<'_, Schedule> {
+        let mut seen = self.schedule.lock().unwrap();
+        let Some(wanted) = self.config.as_ref().map(|c| c.get().traffic_schedule()) else {
+            return seen;
+        };
+        if wanted != *seen {
+            let now = unix_now();
+            let (old, new) = (seen.period(now), wanted.period(now));
+            info!(
+                "traffic schedule: day {} UTC{:+}min",
+                wanted.reset_day, wanted.utc_offset_min
+            );
+            if old != new {
+                for rec in self.records().unwrap_or_default() {
+                    let mut t = self.load_traffic(&rec.id);
+                    if t.period == old {
+                        t.period = new.clone();
+                        self.save_traffic(&rec.id, &t);
+                    }
+                }
+            }
+            *seen = wanted;
+        }
+        seen
+    }
+
     fn period(&self) -> String {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        period_key(now, self.reset_day)
+        self.traffic_schedule().period(unix_now())
+    }
+
+    /// When the current traffic period ends (unix time).
+    pub fn next_traffic_reset(&self) -> u64 {
+        self.traffic_schedule().next_reset(unix_now())
+    }
+
+    fn save_traffic(&self, id: &str, t: &Traffic) {
+        let result = serde_json::to_vec(t)
+            .map_err(anyhow::Error::from)
+            .and_then(|raw| fsutil::write_atomic(&self.dir(id).join("traffic.json"), &raw));
+        if let Err(e) = result {
+            warn!("traffic {id}: {e:#}");
+        }
     }
 
     fn load_traffic(&self, id: &str) -> Traffic {
@@ -698,7 +755,8 @@ impl Runtime {
     /// persisted totals. Call periodically (and before deleting nothing:
     /// totals of deleted instances are discarded with them).
     pub async fn sample_traffic(&self) {
-        let period = self.period();
+        let schedule = self.traffic_schedule();
+        let period = schedule.period(unix_now());
         let Ok(records) = self.records() else { return };
         for rec in records {
             let base = Path::new("/sys/class/net").join(self.net.host_if(rec.idx));
@@ -718,17 +776,9 @@ impl Runtime {
             };
             let mut t = self.load_traffic(&rec.id);
             t.update(ifindex as u32, rx, tx, &period);
-            match serde_json::to_vec(&t) {
-                Ok(raw) => {
-                    if let Err(e) =
-                        fsutil::write_atomic(&self.dir(&rec.id).join("traffic.json"), &raw)
-                    {
-                        warn!("traffic {}: {e:#}", rec.id);
-                    }
-                }
-                Err(e) => warn!("traffic {}: {e:#}", rec.id),
-            }
+            self.save_traffic(&rec.id, &t);
         }
+        drop(schedule);
     }
 
     fn summary(&self, rec: &Record, active: bool, period: &str) -> proto::VmSummary {

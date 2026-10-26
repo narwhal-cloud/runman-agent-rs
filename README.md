@@ -46,6 +46,8 @@ bash install.sh --token '<平台下发的 Token>'      # 接入平台
 - **忘记面板密码**：`echo '新密码' | runman-agent set-password`。
 - **接入或断开平台**：`runman-agent set-token '<Token>'` / `runman-agent set-token --clear`，然后执行 `systemctl restart runman-agent`；也可以在面板「设置」里操作（立即生效）。节点上已有本地实例时接入平台要谨慎：平台会删除它数据库里没有的实例。
 
+- **流量重置**：实例的本月流量在每月 `traffic_reset_day` 号 00:00 清零（默认 1 号，时区 `traffic_timezone` 默认 `+00:00`，国内节点一般设成 `+08:00`），在面板「设置 → 流量统计」中修改立即生效，当前周期已用的流量会保留到新的重置时间。
+
 配置文件为 `/etc/runman-agent/config.toml`，全部配置项见 [config.example.toml](config.example.toml)。
 
 ## 发布与自更新

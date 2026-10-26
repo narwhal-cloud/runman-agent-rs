@@ -374,7 +374,20 @@ async fn overview(State(web): State<Arc<Web>>) -> ApiResult<Json<Value>> {
         "entry": { "ipv4": entry.ipv4, "ipv6": entry.ipv6, "host": cfg.host },
         "host": host,
         "images": images.iter().map(|i| json!({ "id": i.id, "name": i.name })).collect::<Vec<_>>(),
+        "traffic": traffic_info(&cfg),
     })))
+}
+
+/// Monthly traffic schedule as the panel shows it.
+fn traffic_info(cfg: &config::Config) -> Value {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    json!({
+        "reset_day": cfg.traffic_reset_day,
+        "timezone": cfg.traffic_timezone,
+        "next_reset": cfg.traffic_schedule().next_reset(now),
+    })
 }
 
 async fn instances(State(web): State<Arc<Web>>) -> ApiResult<Json<Value>> {
@@ -813,6 +826,7 @@ async fn get_settings(State(web): State<Arc<Web>>) -> Json<Value> {
         "virt_label": c.virt_label,
         "web_user": c.web_user,
         "token_hint": token_hint,
+        "traffic": traffic_info(&c),
     }))
 }
 
@@ -820,6 +834,8 @@ async fn get_settings(State(web): State<Arc<Web>>) -> Json<Value> {
 struct SettingsReq {
     host: Option<String>,
     bandwidth_mbps: Option<u32>,
+    traffic_reset_day: Option<u32>,
+    traffic_timezone: Option<String>,
 }
 
 async fn put_settings(
@@ -833,12 +849,29 @@ async fn put_settings(
     {
         return Err(err(StatusCode::BAD_REQUEST, "invalid host"));
     }
+    if let Some(d) = req.traffic_reset_day
+        && !(1..=28).contains(&d)
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "traffic reset day must be 1-28",
+        ));
+    }
+    if let Some(tz) = &req.traffic_timezone {
+        config::parse_utc_offset(tz).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    }
     web.cfg().update(|c| {
         if let Some(h) = req.host {
             c.host = h;
         }
         if let Some(b) = req.bandwidth_mbps {
             c.bandwidth_mbps = b;
+        }
+        if let Some(d) = req.traffic_reset_day {
+            c.traffic_reset_day = d;
+        }
+        if let Some(tz) = req.traffic_timezone {
+            c.traffic_timezone = tz;
         }
     })?;
     info!("panel: settings updated");

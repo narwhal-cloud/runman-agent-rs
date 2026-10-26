@@ -659,3 +659,56 @@ async fn image_management_needs_a_capable_backend() {
     .await;
     assert_eq!(r.status(), 501);
 }
+
+#[tokio::test]
+async fn traffic_schedule_settings() {
+    let p = start().await;
+    let c = client();
+    login(&p, &c, PASSWORD).await;
+    let put = |body: Value| {
+        c.put(format!("{}/api/settings", p.base))
+            .header("X-Runman", "1")
+            .json(&body)
+            .send()
+    };
+    let r = put(json!({"traffic_reset_day": 15, "traffic_timezone": "+08:00"}))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let cfg = p.store.get();
+    assert_eq!(
+        (cfg.traffic_reset_day, cfg.traffic_timezone.as_str()),
+        (15, "+08:00")
+    );
+
+    for bad in [
+        json!({"traffic_reset_day": 29}),
+        json!({"traffic_timezone": "Asia/Shanghai"}),
+    ] {
+        assert_eq!(put(bad).await.unwrap().status(), 400);
+    }
+    assert_eq!(
+        p.store.get().traffic_reset_day,
+        15,
+        "rejected values are not stored"
+    );
+
+    let s: Value = c
+        .get(format!("{}/api/settings", p.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["traffic"]["reset_day"], 15);
+    assert_eq!(s["traffic"]["timezone"], "+08:00");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let next = s["traffic"]["next_reset"].as_u64().unwrap();
+    assert!(next > now && next - now <= 31 * 86_400);
+    // Midnight in UTC+8 is 16:00 UTC.
+    assert_eq!(next % 86_400, 16 * 3600);
+}
