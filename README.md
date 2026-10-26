@@ -68,6 +68,8 @@ openssl genpkey -algorithm ed25519 -out update-signing-key.pem
 openssl pkey -in update-signing-key.pem -pubout -outform DER | tail -c 32 | base64
 ```
 
+没配置这两项时，Release 和 Images 工作流仍会构建（用于检查），但会跳过发布并给出警告。
+
 更换密钥后，已部署的节点仍只信任旧公钥，需要用新版 `install.sh` 重新安装一次才能继续自动更新。
 
 ## 实例镜像
@@ -82,6 +84,15 @@ openssl pkey -in update-signing-key.pem -pubout -outform DER | tail -c 32 | base
 | Alpine 3.24 | 7 MB | 25 MB | 2 MB |
 
 本地构建：`sudo bash images/build.sh debian amd64 dist`（需要 mmdebstrap 和 zstd，且必须在目标架构上运行）。
+
+### 自定义镜像
+
+在面板的「镜像」页可以在线构建自定义镜像：选一个基础镜像，写一段 shell 脚本（例如 `apt-get install -y nginx`）。节点会用基础镜像启动一台临时实例（2 核 / 2 GB / 20 GB，可联网，不出现在实例列表里也不上报平台），以 root 执行脚本（`set -e`，最长 1 小时），清理包缓存、SSH 主机密钥和 machine-id 后保存为新镜像，临时实例随后删除。构建日志可实时查看。
+
+- 同一 ID 重新构建会生成新版本，新实例使用新版本，已有实例不受影响；
+- 删除自定义镜像后不能再用它创建实例，文件在没有实例使用后自动清理；
+- 自定义镜像的 ID 就是平台下发的 `os_image`，平台模式下也可以直接使用；
+- 同时只运行一个构建，agent 重启会中断构建并清理临时实例。
 
 ## 开发
 

@@ -84,6 +84,7 @@ pre.log { max-height: 65vh; overflow: auto; background: var(--code); padding: 10
       <button data-tab="overview" class="active">概览</button>
       <button data-tab="instances">实例</button>
       <button data-tab="wg">独立 IP</button>
+      <button data-tab="images">镜像</button>
       <button data-tab="firewall">防火墙</button>
       <button data-tab="settings">设置</button>
     </nav>
@@ -94,6 +95,7 @@ pre.log { max-height: 65vh; overflow: auto; background: var(--code); padding: 10
     <section id="tab-overview"></section>
     <section id="tab-instances" class="hidden"></section>
     <section id="tab-wg" class="hidden"></section>
+    <section id="tab-images" class="hidden"></section>
     <section id="tab-firewall" class="hidden"></section>
     <section id="tab-settings" class="hidden"></section>
   </main>
@@ -157,9 +159,9 @@ function switchTab(tab) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('main > section').forEach(s => s.classList.toggle('hidden', s.id !== 'tab-' + tab));
   clearInterval(timer);
-  const load = { overview: loadOverview, instances: loadInstances, wg: loadWg, firewall: loadFirewall, settings: loadSettings }[tab];
+  const load = { overview: loadOverview, instances: loadInstances, wg: loadWg, images: loadImages, firewall: loadFirewall, settings: loadSettings }[tab];
   load();
-  if (tab === 'overview' || tab === 'instances') timer = setInterval(load, 10000);
+  if (tab === 'overview' || tab === 'instances' || tab === 'images') timer = setInterval(load, 10000);
 }
 
 // ── overview ──
@@ -319,6 +321,115 @@ $('#tab-instances').addEventListener('click', async e => {
   } catch (err) { toast('失败：' + err.message); }
   loadInstances();
 });
+
+// ── images ──
+const EXAMPLE_SCRIPT = `# 以 root 运行，可联网；任一命令失败即构建失败。示例：
+apt-get update
+apt-get install -y nginx
+systemctl enable nginx`;
+let imageFormDraft = null;
+
+async function loadImages() {
+  const el = $('#tab-images');
+  if (el.querySelector('#build-form') && el.contains(document.activeElement)) return; // do not wipe a form being edited
+  try {
+    const [images, builds] = await Promise.all([api('/api/images'), api('/api/images/builds')]);
+    const draft = imageFormDraft || {};
+    el.innerHTML = `
+      <div class="table-wrap"><table>
+        <tr><th>镜像</th><th>ID</th><th>版本</th><th>来源</th><th>使用中</th><th></th></tr>
+        ${images.map(i => `<tr data-id="${esc(i.id)}">
+          <td>${esc(i.name)}</td><td class="mono">${esc(i.id)}</td><td class="mono">${esc(i.serial)}</td>
+          <td>${i.custom ? `自定义（基于 <code>${esc(i.base)}</code>）` : '官方'}</td><td>${i.in_use} 个实例</td>
+          <td><div class="actions">
+            ${i.custom ? '<button class="btn" data-act="edit">编辑重建</button><button class="btn danger" data-act="delete">删除</button>' : ''}
+            <button class="btn" data-act="base">以此为基础</button></div></td></tr>`).join('')}
+      </table></div>
+      <div class="card section"><h2>构建自定义镜像</h2>
+        <form id="build-form">
+          <div class="row">
+            <label>镜像 ID（小写字母、数字、-）<input name="image_id" required pattern="[a-z0-9][a-z0-9-]{0,39}" value="${esc(draft.image_id || '')}"></label>
+            <label>名称<input name="name" required maxlength="64" value="${esc(draft.name || '')}" style="width:220px"></label>
+            <label>基础镜像<select name="base">${images.map(i => `<option value="${esc(i.id)}"${i.id === draft.base ? ' selected' : ''}>${esc(i.name)}</option>`).join('')}</select></label>
+          </div>
+          <p class="muted">构建会用基础镜像启动一台临时实例（2 核 / 2 GB / 20 GB，可联网），以 root 执行下面的脚本，成功后保存为新镜像。同一 ID 重新构建会生成新版本，已有实例不受影响。</p>
+          <textarea name="script" rows="12" style="width:100%;font-family:monospace" required placeholder="${esc(EXAMPLE_SCRIPT)}">${esc(draft.script || '')}</textarea>
+          <p><button class="btn primary">开始构建</button></p>
+        </form></div>
+      <div class="section"><h2>构建记录</h2>
+        <div class="table-wrap"><table>
+          <tr><th>镜像</th><th>基础</th><th>状态</th><th>开始</th><th></th></tr>
+          ${builds.map(b => `<tr data-build="${esc(b.id)}">
+            <td>${esc(b.name)} <span class="muted mono">${esc(b.image_id)}</span></td><td class="mono">${esc(b.base)}</td>
+            <td><span class="badge ${b.state === 'succeeded' ? 'ok' : b.state === 'failed' ? 'bad' : 'warn'}">${{running: '构建中', succeeded: '成功', failed: '失败'}[b.state] || esc(b.state)}</span>
+              ${b.error ? `<div class="muted">${esc(b.error)}</div>` : ''}</td>
+            <td>${new Date(b.started * 1000).toLocaleString()}</td>
+            <td><button class="btn" data-act="log">日志</button></td></tr>`).join('') || '<tr><td colspan="5" class="muted">暂无</td></tr>'}
+        </table></div></div>`;
+    imageFormDraft = null;
+  } catch (e) { el.textContent = e.message; }
+}
+
+function captureDraft() {
+  const f = $('#build-form'); if (!f) return;
+  const d = new FormData(f);
+  imageFormDraft = { image_id: d.get('image_id'), name: d.get('name'), base: d.get('base'), script: d.get('script') };
+}
+
+async function showBuildLog(id) {
+  dialog('构建日志', '<pre class="log" id="build-log">加载中…</pre>', () => clearInterval(logTimer));
+  let logTimer = null;
+  const refresh = async () => {
+    try {
+      const r = await fetch(`/api/images/builds/${id}/log`, { credentials: 'same-origin' });
+      const pre = $('#build-log'); if (!pre) return clearInterval(logTimer);
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+      pre.textContent = (await r.text()).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '') || '（空）';
+      if (atBottom) pre.scrollTop = pre.scrollHeight;
+      const b = (await api('/api/images/builds')).find(x => x.id === id);
+      if (!b || b.state !== 'running') clearInterval(logTimer);
+    } catch { clearInterval(logTimer); }
+  };
+  await refresh();
+  logTimer = setInterval(refresh, 2000);
+}
+
+$('#tab-images').addEventListener('submit', async e => {
+  if (e.target.id !== 'build-form') return;
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const body = { image_id: f.get('image_id'), name: f.get('name'), base: f.get('base'), script: f.get('script') };
+  try {
+    const r = await api('/api/images/builds', { method: 'POST', body });
+    toast('构建已开始');
+    document.activeElement.blur();
+    await loadImages();
+    showBuildLog(r.build_id);
+  } catch (err) { toast('无法开始构建：' + err.message); }
+});
+
+$('#tab-images').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-act]'); if (!b) return;
+  const row = b.closest('tr');
+  if (b.dataset.act === 'log') return showBuildLog(row.dataset.build);
+  const id = row.dataset.id;
+  try {
+    if (b.dataset.act === 'delete') {
+      if (!confirm(`删除自定义镜像 ${id}？使用它的实例不受影响，新实例将不能再选择它。`)) return;
+      await api('/api/images/' + encodeURIComponent(id), { method: 'DELETE' }); toast('已删除');
+      return loadImages();
+    }
+    const images = await api('/api/images');
+    const img = images.find(i => i.id === id);
+    imageFormDraft = b.dataset.act === 'edit'
+      ? { image_id: img.id, name: img.name, base: img.base, script: img.script }
+      : { image_id: '', name: '', base: img.id, script: '' };
+    document.activeElement.blur();
+    await loadImages();
+    $('#build-form').scrollIntoView({ behavior: 'smooth' });
+  } catch (err) { toast('失败：' + err.message); }
+});
+$('#tab-images').addEventListener('input', captureDraft);
 
 // ── dedicated IPs ──
 async function loadWg() {

@@ -43,13 +43,8 @@ jobs:
       - name: Install cargo-zigbuild
         run: pip3 install --break-system-packages ziglang cargo-zigbuild
       - name: Check signing key variable
-        env:
-          UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
-        run: |
-          if [ -z "$UPDATE_PUBKEY" ]; then
-            echo "::error::repository variable UPDATE_PUBKEY is not set; released binaries could not verify updates"
-            exit 1
-          fi
+        if: vars.UPDATE_PUBKEY == ''
+        run: echo "::warning::repository variable UPDATE_PUBKEY is not set; building without a release key and not publishing"
       - name: Build
         env:
           RUNMAN_UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
@@ -68,6 +63,8 @@ jobs:
 
   publish:
     needs: build
+    # Without the release key, agents could not verify what we publish.
+    if: vars.UPDATE_PUBKEY != ''
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5

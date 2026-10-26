@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::model::{
-    ConsoleSize, HostSnapshot, InstanceDetails, InstanceSpec, L4Proto, PortForward, VmId,
+    BuildInfo, BuildRequest, ConsoleSize, HostSnapshot, ImageInfo, InstanceDetails, InstanceSpec,
+    L4Proto, PortForward, VmId,
 };
 use crate::proto;
 
@@ -81,6 +82,18 @@ pub trait HostMetrics: Send + Sync {
     async fn snapshot(&self) -> Result<HostSnapshot>;
 }
 
+/// Image management for the local panel: listing, custom builds, removal.
+#[async_trait]
+pub trait ImageAdmin: Send + Sync {
+    async fn list_images(&self) -> Result<Vec<ImageInfo>>;
+    /// Start a build in the background; returns the build id.
+    fn start_build(&self, req: BuildRequest) -> Result<String>;
+    fn builds(&self) -> Vec<BuildInfo>;
+    fn build_log(&self, build_id: &str) -> Result<String>;
+    /// Stop offering a custom image (files go once no instance uses them).
+    async fn delete_image(&self, id: &str) -> Result<()>;
+}
+
 /// Bundle of services handed to the protocol layer.
 #[derive(Clone)]
 pub struct Services {
@@ -88,6 +101,8 @@ pub struct Services {
     pub port_forwards: Arc<dyn PortForwards>,
     pub wg: Arc<dyn WgBindings>,
     pub host: Arc<dyn HostMetrics>,
+    /// None for backends without image management (the in-memory fake).
+    pub images: Option<Arc<dyn ImageAdmin>>,
 }
 
 /// Every instance gets a random host port forwarded to SSH (22/tcp), as the

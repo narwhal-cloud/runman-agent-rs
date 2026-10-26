@@ -639,3 +639,23 @@ async fn standalone_mode_manages_the_node() {
         "clearing returns to standalone mode"
     );
 }
+
+#[tokio::test]
+async fn image_management_needs_a_capable_backend() {
+    let p = start_with_token("").await;
+    let c = client();
+    login(&p, &c, PASSWORD).await;
+    let r = c
+        .get(format!("{}/api/images", p.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 501);
+    let r = post(
+        &c,
+        format!("{}/api/images/builds", p.base),
+        json!({"image_id": "web", "name": "Web", "base": "debian", "script": "true"}),
+    )
+    .await;
+    assert_eq!(r.status(), 501);
+}

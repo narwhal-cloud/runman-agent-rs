@@ -33,10 +33,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::backend::Services;
-use crate::backend::ensure_ssh_forward;
+use crate::backend::{ImageAdmin, ensure_ssh_forward};
 use crate::config;
 use crate::local_wg::{LocalWg, parse_wg_quick};
-use crate::model::{ConsoleSize, InstanceSpec, L4Proto, PortForward, VmId, validate_password};
+use crate::model::{
+    BuildRequest, ConsoleSize, InstanceSpec, L4Proto, PortForward, VmId, validate_password,
+};
 use crate::platform::Agent;
 use crate::updater::{Outcome, Updater};
 
@@ -130,6 +132,10 @@ impl Web {
                 axum::routing::delete(delete_forward),
             )
             .route("/api/wg", get(list_wg).post(add_wg))
+            .route("/api/images", get(list_images))
+            .route("/api/images/{id}", axum::routing::delete(delete_image))
+            .route("/api/images/builds", get(list_builds).post(start_build))
+            .route("/api/images/builds/{id}/log", get(build_log))
             .route("/api/wg/{resource}", axum::routing::delete(delete_wg))
             .route("/api/instances/{id}/power", post(power))
             .route("/api/instances/{id}/password", post(reset_password))
@@ -744,6 +750,51 @@ async fn delete_wg(
     }
     web.local_wg.apply(web.services.wg.as_ref()).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ── images ──────────────────────────────────────────────────────────────────
+
+fn image_admin(web: &Web) -> ApiResult<&Arc<dyn ImageAdmin>> {
+    web.services.images.as_ref().ok_or_else(|| {
+        err(
+            StatusCode::NOT_IMPLEMENTED,
+            "this backend has no image management",
+        )
+    })
+}
+
+async fn list_images(State(web): State<Arc<Web>>) -> ApiResult<Json<Value>> {
+    Ok(Json(
+        serde_json::to_value(image_admin(&web)?.list_images().await?).unwrap_or_default(),
+    ))
+}
+
+async fn delete_image(
+    State(web): State<Arc<Web>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    image_admin(&web)?.delete_image(&id).await?;
+    info!("panel: custom image {id} removed");
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn start_build(
+    State(web): State<Arc<Web>>,
+    Json(req): Json<BuildRequest>,
+) -> ApiResult<Json<Value>> {
+    let id = image_admin(&web)?.start_build(req)?;
+    Ok(Json(json!({ "build_id": id })))
+}
+
+async fn list_builds(State(web): State<Arc<Web>>) -> ApiResult<Json<Value>> {
+    Ok(Json(
+        serde_json::to_value(image_admin(&web)?.builds()).unwrap_or_default(),
+    ))
+}
+
+async fn build_log(State(web): State<Arc<Web>>, Path(id): Path<String>) -> ApiResult<Response> {
+    let text = image_admin(&web)?.build_log(&id)?;
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response())
 }
 
 // ── settings ────────────────────────────────────────────────────────────────

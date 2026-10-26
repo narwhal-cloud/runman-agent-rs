@@ -169,8 +169,9 @@ async fn agent_main() -> Result<()> {
             Services {
                 instances: rt.clone(),
                 port_forwards: rt.clone(),
-                wg: rt,
+                wg: rt.clone(),
                 host: Arc::new(ProcMetrics::new(cfg.data_dir.clone())),
+                images: Some(Arc::new(runman_agent::runtime::build::ImageAdminHandle(rt))),
             }
         }
     };

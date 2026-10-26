@@ -47,6 +47,7 @@ impl Fake {
             port_forwards: self.clone(),
             wg: self.clone(),
             host: self.clone(),
+            images: None,
         }
     }
 

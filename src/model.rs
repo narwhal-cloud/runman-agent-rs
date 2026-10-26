@@ -247,3 +247,42 @@ pub fn status_name(status: i32) -> &'static str {
         _ => "unknown",
     }
 }
+
+/// An image offered for new instances.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct ImageInfo {
+    pub id: String,
+    pub name: String,
+    pub serial: String,
+    pub custom: bool,
+    /// Custom images: what they were built from and how.
+    pub base: String,
+    pub script: String,
+    /// Instances currently built on any version of this image.
+    pub in_use: usize,
+}
+
+/// Request to build a custom image on the node.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BuildRequest {
+    /// New image id (`[a-z0-9-]`), also what instances are created with.
+    pub image_id: String,
+    pub name: String,
+    /// Image to start from (official or custom).
+    pub base: String,
+    /// Shell script run as root inside a temporary instance.
+    pub script: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct BuildInfo {
+    pub id: String,
+    pub image_id: String,
+    pub name: String,
+    pub base: String,
+    /// "running", "succeeded" or "failed".
+    pub state: String,
+    pub error: String,
+    pub started: u64,
+    pub finished: Option<u64>,
+}

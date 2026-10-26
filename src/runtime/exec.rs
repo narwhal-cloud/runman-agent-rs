@@ -167,6 +167,37 @@ impl ExecTarget {
         Ok(())
     }
 
+    /// Run a command feeding `stdin`, appending its stdout and stderr to
+    /// `log` as they come; killed after `timeout`. Returns the exit code.
+    pub async fn run_logged(
+        &self,
+        argv: &[&str],
+        stdin: &[u8],
+        log: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<i32> {
+        let out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)?;
+        let mut child = tokio::process::Command::from(self.command(argv))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(out.try_clone()?))
+            .stderr(Stdio::from(out))
+            .kill_on_drop(true)
+            .spawn()?;
+        if let Some(mut input) = child.stdin.take() {
+            tokio::io::AsyncWriteExt::write_all(&mut input, stdin).await?;
+        }
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(status) => Ok(status?.code().unwrap_or(-1)),
+            Err(_) => {
+                let _ = child.kill().await;
+                bail!("timed out after {timeout:?}")
+            }
+        }
+    }
+
     /// Start an interactive login shell on a fresh pty.
     pub fn console(&self, size: Option<ConsoleSize>) -> Result<ConsoleIo> {
         let ws = size.map(winsize);

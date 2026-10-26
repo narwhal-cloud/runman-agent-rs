@@ -12,6 +12,7 @@
 //! Port forwards live in `<data>/portforwards.json`.
 
 pub mod attach;
+pub mod build;
 pub mod customize;
 pub mod exec;
 pub mod fsutil;
@@ -98,6 +99,10 @@ struct Record {
     hostname: String,
     addrs: Addrs,
     desired: Desired,
+    /// Temporary instance building a custom image: hidden from listings and
+    /// heartbeats (the platform would delete it as an orphan).
+    #[serde(default)]
+    builder: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +136,7 @@ pub struct Runtime {
     vm_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Serializes instance index allocation (see `create_locked`).
     alloc: Mutex<()>,
+    builds: build::Builds,
 }
 
 impl Runtime {
@@ -169,6 +175,7 @@ impl Runtime {
             net_pending: Mutex::default(),
             vm_locks: Mutex::default(),
             alloc: Mutex::default(),
+            builds: build::Builds::new(&data_dir.join("image-builds"))?,
         })
     }
 
@@ -237,6 +244,11 @@ impl Runtime {
         if let Err(e) = self.images.sync().await {
             warn!("image sync: {e:#}");
         }
+        self.gc_images();
+    }
+
+    /// Drop image versions no instance is built on.
+    pub fn gc_images(&self) {
         let _alloc = self.alloc.lock().unwrap();
         let in_use: Vec<PathBuf> = self
             .records()
@@ -273,6 +285,17 @@ impl Runtime {
             self.net.enable_v6().await?;
         }
         self.reconcile_network().await?;
+        // Builds do not survive a restart; drop their temporary instances.
+        for rec in self.records()?.into_iter().filter(|r| r.builder) {
+            let id = VmId::parse(&rec.id).expect("record ids are validated");
+            warn!(
+                "removing builder {} left by an interrupted image build",
+                rec.id
+            );
+            if let Err(e) = self.delete(&id).await {
+                warn!("remove builder {}: {e:#}", rec.id);
+            }
+        }
         for rec in self
             .records()?
             .into_iter()
@@ -473,6 +496,18 @@ impl Runtime {
         fresh: bool,
         f: impl FnOnce(&RootFs) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.with_offline_path(rec, fresh, move |path| f(&RootFs::open(path)?))
+            .await
+    }
+
+    /// Like `with_offline_rootfs`, handing `f` the mounted path (for bulk
+    /// copies; prefer `RootFs` for edits).
+    async fn with_offline_path<T: Send + 'static>(
+        &self,
+        rec: &Record,
+        fresh: bool,
+        f: impl FnOnce(&Path) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let rs = self.run_spec(rec);
         let (disk, rootfs) = (rs.mnt_disk(), rs.mnt_rootfs());
         run(Command::new("mount")
@@ -501,7 +536,7 @@ impl Runtime {
             .await
             .context("mount overlay")?;
             let path = rootfs.clone();
-            tokio::task::spawn_blocking(move || f(&RootFs::open(&path)?)).await?
+            tokio::task::spawn_blocking(move || f(&path)).await?
         }
         .await;
         let _ = sys::umount_if_mounted(&rootfs);
@@ -797,7 +832,7 @@ fn hostname_for(id: &str) -> String {
 
 impl Runtime {
     /// `create` with the instance lock held.
-    async fn create_locked(&self, spec: &InstanceSpec) -> Result<()> {
+    async fn create_locked(&self, spec: &InstanceSpec, builder: bool) -> Result<()> {
         let id = spec.vm_id.as_str();
         if self.load(id)?.is_some() || self.dir(id).exists() {
             info!("create {id}: replacing existing instance");
@@ -825,6 +860,7 @@ impl Runtime {
             hostname: hostname_for(id),
             addrs: self.net.addrs_for(idx)?,
             desired: Desired::Running,
+            builder,
         };
         mkdir_private(&self.dir(id))?;
         self.save(&rec)?;
@@ -873,14 +909,14 @@ impl Runtime {
 impl Instances for Runtime {
     async fn create(&self, spec: &InstanceSpec) -> Result<()> {
         let _g = self.lock_vm(spec.vm_id.as_str()).await;
-        self.create_locked(spec).await
+        self.create_locked(spec, false).await
     }
 
     async fn reinstall(&self, spec: &InstanceSpec) -> Result<()> {
         // Delete + create gives a clean disk; port forwards are keyed by the
         // instance id and follow it to its (possibly new) address.
         let _g = self.lock_vm(spec.vm_id.as_str()).await;
-        self.create_locked(spec).await
+        self.create_locked(spec, false).await
     }
 
     async fn start(&self, id: &VmId) -> Result<()> {
@@ -931,7 +967,7 @@ impl Instances for Runtime {
     async fn list(&self) -> Result<Vec<proto::VmSummary>> {
         let period = self.period();
         let mut out = Vec::new();
-        for rec in self.records()? {
+        for rec in self.records()?.into_iter().filter(|r| !r.builder) {
             let active = unit_running(&rec.id);
             out.push(self.summary(&rec, active, &period));
         }
@@ -953,7 +989,7 @@ impl Instances for Runtime {
     async fn details(&self) -> Result<Vec<InstanceDetails>> {
         let period = self.period();
         let mut out = Vec::new();
-        for rec in self.records()? {
+        for rec in self.records()?.into_iter().filter(|r| !r.builder) {
             let active = unit_running(&rec.id);
             let mut d = InstanceDetails::from_summary(&self.summary(&rec, active, &period));
             d.hostname = rec.hostname.clone();

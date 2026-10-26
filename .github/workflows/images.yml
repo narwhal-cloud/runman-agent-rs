@@ -43,6 +43,8 @@ jobs:
 
   publish:
     needs: build
+    # Agents reject an unsigned manifest; skip until the release key is set.
+    if: vars.UPDATE_PUBKEY != ''
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
