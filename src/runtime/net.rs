@@ -252,6 +252,7 @@ impl Net {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
+        self.allow_in_iptables_forward().await;
         if let V6Mode::Subnet {
             prefix,
             len,
@@ -262,6 +263,49 @@ impl Net {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Docker (and ufw's default) set the iptables FORWARD policy to DROP.
+    /// iptables-nft chains hook into forwarding next to our table, and a drop
+    /// in any of them wins, which cuts every instance off. Accept the bridge's
+    /// traffic at the top of FORWARD; isolation and anti-spoofing stay in our
+    /// own tables. Re-checked on every apply (Docker re-inserts its jumps).
+    async fn allow_in_iptables_forward(&self) {
+        for tool in ["iptables", "ip6tables"] {
+            for dir in ["-i", "-o"] {
+                let rule = [
+                    dir,
+                    self.bridge.as_str(),
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "runman",
+                    "-j",
+                    "ACCEPT",
+                ];
+                let present = Command::new(tool)
+                    .args(["-w", "-C", "FORWARD"])
+                    .args(rule)
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+                match present {
+                    Ok(s) if s.success() => {}
+                    // 1 = rule missing; anything else (no iptables, no
+                    // FORWARD chain) means there is nothing to work around.
+                    Ok(s) if s.code() == Some(1) => {
+                        if let Err(e) = run(Command::new(tool)
+                            .args(["-w", "-I", "FORWARD", "1"])
+                            .args(rule))
+                        .await
+                        {
+                            tracing::warn!("{tool}: allow {} in FORWARD: {e:#}", self.bridge);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     async fn sync_v6_routes(

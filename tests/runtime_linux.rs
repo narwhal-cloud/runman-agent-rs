@@ -326,6 +326,35 @@ async fn network_checks(rt: &Runtime, id: &VmId) {
     rt.init().await.expect("re-init");
     assert_eq!(ssh_banner(&format!("{host}:{port}")), "SSH-2.0");
 
+    // A host with Docker (or ufw) drops forwarded traffic by policy.
+    let has_iptables = std::process::Command::new("iptables")
+        .arg("-V")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if has_iptables {
+        let ipt = |args: &[&str]| {
+            std::process::Command::new("iptables")
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(ipt(&["-P", "FORWARD", "DROP"]));
+        rt.heal().await;
+        let web = wait_for(
+            rt,
+            id,
+            "curl -sS -o /dev/null -w '%{http_code}' https://www.cloudflare.com/",
+            |s| s == "200",
+        )
+        .await;
+        assert!(ipt(&["-P", "FORWARD", "ACCEPT"]));
+        assert_eq!(
+            web, "200",
+            "outbound must survive an iptables FORWARD DROP policy"
+        );
+    }
+
     // Self-healing: another tool deletes the instance's veth and our tables.
     let sh = |cmd: &str| {
         assert!(

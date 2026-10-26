@@ -141,6 +141,13 @@ uninstall() {
         done
     fi
     ip link del rmbr0 2>/dev/null || true
+    local tool dir
+    for tool in iptables ip6tables; do
+        command -v "$tool" >/dev/null || continue
+        for dir in -i -o; do
+            while "$tool" -w -D FORWARD "$dir" rmbr0 -m comment --comment runman -j ACCEPT 2>/dev/null; do :; done
+        done
+    done
     local fam rule
     for fam in -4 -6; do
         { ip "$fam" rule show | grep -E 'lookup 20[0-9]{3}' || true; } | while read -r rule; do
