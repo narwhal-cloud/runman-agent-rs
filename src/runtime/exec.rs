@@ -1,7 +1,7 @@
 //! Running commands inside a live instance.
 //!
-//! `runman-agent __exec <init.pid> <cgroup.procs> -- <cmd>...` joins the
-//! instance's namespaces and cgroup, then forks so the command becomes a
+//! `runman-agent __exec <init.pid> <unit cgroup> -- <cmd>...` joins the
+//! instance's cgroup (the one its init is in) and namespaces, then forks so the command becomes a
 //! member of the instance's pid namespace, running as container root. It is a
 //! separate single-threaded process because `setns(CLONE_NEWUSER)` is refused
 //! to multi-threaded callers such as the agent.
@@ -50,8 +50,8 @@ pub fn main(args: &[OsString]) -> ! {
 }
 
 fn helper(args: &[OsString]) -> Result<i32> {
-    let [pid_file, procs, sep, cmd @ ..] = args else {
-        bail!("usage: __exec <init.pid> <cgroup.procs> -- <cmd>...");
+    let [pid_file, unit, sep, cmd @ ..] = args else {
+        bail!("usage: __exec <init.pid> <unit cgroup> -- <cmd>...");
     };
     if sep != "--" || cmd.is_empty() {
         bail!("missing command");
@@ -65,8 +65,18 @@ fn helper(args: &[OsString]) -> Result<i32> {
         .map(|(name, flag)| Ok((File::open(format!("/proc/{pid}/ns/{name}"))?, *flag)))
         .collect::<Result<_>>()
         .context("open instance namespaces")?;
-    // Account the session to the instance's unit (best effort).
-    let _ = std::fs::write(Path::new(procs), std::process::id().to_string());
+    // Join the instance's cgroup before its cgroup namespace (migrations
+    // must stay inside the namespace root afterwards), so the session and
+    // everything started from it is accounted and limited with the
+    // instance: lxcfs reports the memory of init's cgroup, and the CPU limit
+    // is on `ct`.
+    let me = std::process::id().to_string();
+    if !session_cgroups(Path::new(unit), pid)
+        .iter()
+        .any(|dir| std::fs::write(dir.join("cgroup.procs"), &me).is_ok())
+    {
+        bail!("cannot join the instance's cgroup");
+    }
     for (fd, flag) in &fds {
         setns(fd.as_fd(), *flag).with_context(|| format!("setns {flag:?}"))?;
     }
@@ -119,12 +129,65 @@ fn exec_child(argv: &[CString]) -> anyhow::Error {
     }
 }
 
+/// Where to put processes entering the instance, best first: the cgroup of
+/// its init (a populated leaf, so joining it is always allowed: `ct` itself,
+/// or `ct/init.scope` under systemd), then `ct`.
+fn session_cgroups(unit: &Path, init_pid: i32) -> Vec<PathBuf> {
+    let ct = unit.join("ct");
+    let init = std::fs::read_to_string(format!("/proc/{init_pid}/cgroup"))
+        .ok()
+        .and_then(|s| {
+            let rel = s.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+            Some(Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+        })
+        .filter(|p| p.starts_with(&ct) && !p.components().any(|c| c.as_os_str() == ".."));
+    init.into_iter().chain([ct]).collect()
+}
+
+/// Move instance processes that ended up in the unit's `supervisor` cgroup
+/// (sessions of older agents put them there) into the instance's cgroup.
+/// They are recognised by living in the instance's pid namespace; the
+/// supervisor and `__exec` helpers stay in the host's. Returns how many moved.
+pub fn adopt_strays(unit: &Path, init_pid: i32) -> usize {
+    let Ok(host_ns) = std::fs::read_link("/proc/self/ns/pid") else {
+        return 0;
+    };
+    let Ok(ct_ns) = std::fs::read_link(format!("/proc/{init_pid}/ns/pid")) else {
+        return 0;
+    };
+    if ct_ns == host_ns {
+        return 0;
+    }
+    let Ok(procs) = std::fs::read_to_string(unit.join("supervisor/cgroup.procs")) else {
+        return 0;
+    };
+    let targets = session_cgroups(unit, init_pid);
+    let mut moved = 0;
+    for pid in procs.lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
+        if std::fs::read_link(format!("/proc/{pid}/ns/pid"))
+            .ok()
+            .as_ref()
+            != Some(&ct_ns)
+        {
+            continue;
+        }
+        if targets
+            .iter()
+            .any(|dir| std::fs::write(dir.join("cgroup.procs"), pid.to_string()).is_ok())
+        {
+            moved += 1;
+        }
+    }
+    moved
+}
+
 /// How the agent reaches an instance's exec helper.
 #[derive(Clone)]
 pub struct ExecTarget {
     pub exe: PathBuf,
     pub pid_file: PathBuf,
-    pub cgroup_procs: PathBuf,
+    /// The instance's systemd unit cgroup.
+    pub unit_cgroup: PathBuf,
 }
 
 impl ExecTarget {
@@ -132,7 +195,7 @@ impl ExecTarget {
         let mut cmd = std::process::Command::new(&self.exe);
         cmd.arg("__exec")
             .arg(&self.pid_file)
-            .arg(&self.cgroup_procs)
+            .arg(&self.unit_cgroup)
             .arg("--")
             .args(argv);
         cmd.env_clear()

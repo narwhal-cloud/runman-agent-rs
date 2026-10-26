@@ -353,7 +353,7 @@ impl Runtime {
         ExecTarget {
             exe: self.exe.clone(),
             pid_file: Path::new(RUN_ROOT).join(id).join("init.pid"),
-            cgroup_procs: unit_cgroup(id).join("supervisor/cgroup.procs"),
+            unit_cgroup: unit_cgroup(id),
         }
     }
 
@@ -655,6 +655,21 @@ impl Runtime {
             warn!("re-apply network rules: {e:#}");
         }
         let Ok(records) = self.records() else { return };
+        for rec in &records {
+            let rs = self.run_spec(rec);
+            if let Some(pid) = std::fs::read_to_string(rs.init_pid_file())
+                .ok()
+                .and_then(|p| p.trim().parse::<i32>().ok())
+            {
+                let moved = exec::adopt_strays(&unit_cgroup(&rec.id), pid);
+                if moved > 0 {
+                    info!(
+                        "instance {}: moved {moved} process(es) into its cgroup",
+                        rec.id
+                    );
+                }
+            }
+        }
         for rec in records {
             let host_if = self.net.host_if(rec.idx);
             let master =
