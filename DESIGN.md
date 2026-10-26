@@ -43,12 +43,16 @@ rfw (独立进程, 127.0.0.1:7734)   eBPF/XDP 防火墙，由 agent 安装与反
 
 卖的是「完整的 Linux」（systemd/openrc 作为 PID 1、sshd、root 密码），不是 OCI 应用容器，因此只实现所需子集，不做通用 OCI 运行时。
 
-**隔离（安全底线）**
-- 每个实例独立的 user namespace（从 `/etc/subuid` 段分配 65536 个 ID 的映射），容器 root ≠ 宿主 root。
-- mount / pid / net / ipc / uts / cgroup namespace 全开；`pivot_root` 进 rootfs。
-- seccomp 黑名单（kexec、模块加载、`open_by_handle_at`、keyctl 等）；capability 在 userns 内保留，对宿主无效。
-- cgroup v2 设备控制器只放行标准设备 + `/dev/net/tun`。
-- `/proc`、`/sys` 敏感路径只读或屏蔽，`/proc/meminfo`、`cpuinfo`、`uptime` 等由 lxcfs 提供容器视图。
+**隔离（已实现）**
+- 每个实例有独立的 user namespace，UID 段互不重叠，容器里的 root 不等于宿主机 root。mount、pid、net、ipc、uts、cgroup namespace 全部启用，通过 `pivot_root` 进入 rootfs。
+- **seccomp**（`src/runtime/seccomp.rs`）：拦截加载内核模块、kexec、`open_by_handle_at`，返回 EPERM，范围和 LXD 默认一致。过滤器按架构分别处理：x86_64 加 i386、aarch64 加 arm。32 位程序（例如 SteamCMD）照常可用，x32 ABI 整体拒绝。init 进程和控制台会话都会加载这个过滤器。这些调用在 user namespace 里本来就会因为权限不足而失败，seccomp 只是多加一道防线，以防这些路径上出现内核漏洞。
+- **屏蔽宿主机信息**：和 Docker 的屏蔽范围一致。`/proc/{kcore,keys,latency_stats,timer_list,timer_stats,sched_debug,sysrq-trigger}` 覆盖为 `/dev/null`；`/proc/{acpi,scsi,asound}` 和 `/sys/firmware` 覆盖为空的只读 tmpfs；`/sys` 整体只读。
+- **lxcfs**：把 `/proc/{meminfo,cpuinfo,stat,uptime,loadavg,diskstats,swaps,slabinfo}` 和 `/sys/devices/system/cpu` 绑定挂载为实例自己的视图。安装器给 lxcfs 加了 `--enable-cfs -l` 参数。lxcfs 只读取容器 cgroup 根自身的 `cpu.max` 来算 CPU 数，所以 supervisor 会把配额也写到 `ct` 上。
+  - 实测：`free` 显示的是套餐内存，`/proc/cpuinfo` 显示的是套餐核数，`uptime` 是实例自己的运行时间。
+  - `nproc` 仍显示宿主机核数：它读的是调度亲和性，只有把实例绑定到具体 CPU 核（cpuset）才能改变，目前没做。
+  - 重启 lxcfs 会让运行中的实例失去这些视图，直到实例重启。安装器只在 lxcfs 参数变化时才重启它。
+
+**宿主机内核参数**（由安装器写入 `/etc/sysctl.d/90-runman.conf`）：inotify、keys、pid_max、max_map_count、邻居表上限，以及 BBR。实测证实，inotify 实例上限是所有实例共用宿主机同一个用户的份额：宿主机总用量 86 时把上限设为 60，任何实例都无法再新建 inotify（EMFILE）。默认的 128 大约在开到第 14 个 Debian 实例时就会耗尽，届时所有实例里的服务都会开始启动失败。agent 启动时如果发现上限低于 8192，会记录警告。
 
 **TUN 支持**：默认对每个实例开放 `/dev/net/tun`（cgroup 放行 `c 10:200 rwm`，并 bind mount 设备节点）。容器 root 在自己的 user namespace / network namespace 内拥有 CAP_NET_ADMIN，可以直接运行 WireGuard-go、OpenVPN、tailscale、sing-box TUN 模式，影响不到宿主机。按实例可关闭。
 
@@ -141,7 +145,6 @@ rfw (独立进程, 127.0.0.1:7734)   eBPF/XDP 防火墙，由 agent 安装与反
 - **公网入口 IP** 每 5 分钟通过 ip.sb 探测一次，写进心跳。带宽改为在配置里填写 `bandwidth_mbps`，不再每次启动都测速。
 - **开发工具** `examples/mock_platform.rs`：模拟平台，从 stdin 下发命令，打印心跳和回执。
 
-待办：接入 lxcfs，让实例里的 `/proc/meminfo`、`/proc/uptime`、`/proc/cpuinfo` 显示实例自己的数值。现在 `free`、`uptime` 看到的是宿主机的数值。
 
 ## 6. 安装器原则
 

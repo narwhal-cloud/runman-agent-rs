@@ -163,6 +163,37 @@ async fn instance_lifecycle() {
     let df = console_run(&rt, &id, "df -BG --output=size / | tail -1").await;
     assert_eq!(df.trim(), "3G");
 
+    // lxcfs: the instance sees its own memory, CPUs and uptime.
+    let mem: u64 = console_run(&rt, &id, "free -m | awk '/^Mem:/ {print $2}'")
+        .await
+        .parse()
+        .unwrap();
+    assert!(
+        (400..=600).contains(&mem),
+        "free shows {mem} MB, plan has 512"
+    );
+    // /proc/cpuinfo follows the CPU quota (`nproc` reports the scheduler
+    // affinity instead, which only CPU pinning would change).
+    assert_eq!(
+        console_run(&rt, &id, "grep -c ^processor /proc/cpuinfo").await,
+        "1"
+    );
+    let up: u64 = console_run(&rt, &id, "cut -d. -f1 /proc/uptime")
+        .await
+        .parse()
+        .unwrap();
+    assert!(up < 600, "uptime {up}s is the host's, not the instance's");
+    // Host details are masked; init and console sessions are filtered.
+    assert_eq!(console_run(&rt, &id, "wc -c < /proc/timer_list").await, "0");
+    assert_eq!(
+        console_run(&rt, &id, "awk '/^Seccomp:/ {print $2}' /proc/1/status").await,
+        "2"
+    );
+    assert_eq!(
+        console_run(&rt, &id, "awk '/^Seccomp:/ {print $2}' /proc/self/status").await,
+        "2"
+    );
+
     network_checks(&rt, &id).await;
 
     // Online password reset: verify the hash changed.

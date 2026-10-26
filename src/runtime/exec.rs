@@ -106,6 +106,8 @@ fn exec_child(argv: &[CString]) -> anyhow::Error {
         if nix::unistd::chdir("/root").is_err() {
             nix::unistd::chdir("/")?;
         }
+        // Console sessions get the same seccomp filter as the instance's init.
+        super::seccomp::install()?;
         // execvp searches the PATH of the current environment.
         unsafe { std::env::set_var("PATH", PATH) };
         nix::unistd::execvp(&argv[0], argv)?;

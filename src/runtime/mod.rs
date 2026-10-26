@@ -17,6 +17,7 @@ pub mod exec;
 pub mod fsutil;
 pub mod image;
 pub mod net;
+pub mod seccomp;
 pub mod spec;
 pub mod supervisor;
 pub mod sys;
@@ -231,6 +232,19 @@ impl Runtime {
     /// running (after boot or an agent upgrade).
     pub async fn init(&self) -> Result<()> {
         self.net.setup_host().await.context("host network setup")?;
+        let inotify = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_instances")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if inotify < 8192 {
+            // Every instance runs a full init; their inotify instances all
+            // count against one host user, so the default (128) runs out
+            // after a handful of instances.
+            warn!(
+                "fs.inotify.max_user_instances is {inotify}; instances will fail to start services. \
+                 Re-run install.sh or set it to 65536 (/etc/sysctl.d/90-runman.conf)"
+            );
+        }
         if self
             .dedicated
             .lock()
@@ -269,6 +283,7 @@ impl Runtime {
             stop_signal: rec.stop_signal.clone(),
             tun: self.tun,
             run_dir: Path::new(RUN_ROOT).join(&rec.id),
+            cpus: rec.cpu,
             net: Some(NetSpec {
                 host_if: self.net.host_if(rec.idx),
                 bridge: self.net.bridge.clone(),
@@ -730,6 +745,13 @@ fn load_forwards(path: &Path) -> Result<Vec<PortForward>> {
         .collect()
 }
 
+/// Status check for reports (no process spawn per instance): the unit's
+/// cgroup exists and holds processes. Lifecycle operations still ask systemd.
+fn unit_running(id: &str) -> bool {
+    std::fs::read_to_string(unit_cgroup(id).join("cgroup.events"))
+        .is_ok_and(|e| e.contains("populated 1"))
+}
+
 fn read_kv(path: &Path, key: &str) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.lines().find_map(|l| {
         let (k, v) = l.split_once(' ')?;
@@ -884,7 +906,7 @@ impl Instances for Runtime {
         let period = self.period();
         let mut out = Vec::new();
         for rec in self.records()? {
-            let active = self.is_active(&rec.id).await;
+            let active = unit_running(&rec.id);
             out.push(self.summary(&rec, active, &period));
         }
         Ok(out)
@@ -906,7 +928,7 @@ impl Instances for Runtime {
         let period = self.period();
         let mut out = Vec::new();
         for rec in self.records()? {
-            let active = self.is_active(&rec.id).await;
+            let active = unit_running(&rec.id);
             let mut d = InstanceDetails::from_summary(&self.summary(&rec, active, &period));
             d.hostname = rec.hostname.clone();
             d.cpu = rec.cpu;

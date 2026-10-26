@@ -39,8 +39,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Host packages
-        run: sudo apt-get install -y -qq nftables wireguard-tools e2fsprogs
+      - name: Host packages and limits (as install.sh sets them)
+        run: |
+          sudo apt-get install -y -qq nftables wireguard-tools e2fsprogs lxcfs
+          sudo install -d /etc/systemd/system/lxcfs.service.d
+          printf '[Service]\nExecStart=\nExecStart=/usr/bin/lxcfs --enable-cfs -l /var/lib/lxcfs\n' \
+            | sudo tee /etc/systemd/system/lxcfs.service.d/runman.conf >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart lxcfs
+          sudo sysctl -q -w fs.inotify.max_user_instances=65536
       - name: Build tests
         run: cargo test --release --test runtime_linux --no-run
       - name: Runtime integration tests

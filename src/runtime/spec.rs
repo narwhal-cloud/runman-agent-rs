@@ -29,6 +29,10 @@ pub struct RunSpec {
     pub run_dir: PathBuf,
     /// None: loopback only.
     pub net: Option<NetSpec>,
+    /// CPU quota in cores, mirrored onto the instance's cgroup root so lxcfs
+    /// can show it (the effective limit is the unit's `CPUQuota`).
+    #[serde(default)]
+    pub cpus: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

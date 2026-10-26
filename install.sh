@@ -151,7 +151,8 @@ uninstall() {
         systemctl disable --now rfw.service 2>/dev/null || true
         rm -f /etc/systemd/system/rfw.service "$RFW_BIN"
     fi
-    rm -f /etc/systemd/system/runman-agent.service /etc/modules-load.d/runman.conf "$BIN"
+    rm -f /etc/systemd/system/runman-agent.service /etc/modules-load.d/runman.conf "$BIN" \
+        /etc/sysctl.d/90-runman.conf /etc/systemd/system/lxcfs.service.d/runman.conf
     rm -rf "$CONFIG_DIR" /run/runman-agent
     if [ "$PURGE" = 1 ]; then
         local dir
@@ -193,12 +194,46 @@ log "installing packages"
 apt_get() { LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 -y -q "$@"; }
 apt_get update >/dev/null
 apt_get install --no-install-recommends \
-    ca-certificates curl iproute2 nftables wireguard-tools e2fsprogs tar gzip util-linux kmod >/dev/null
+    ca-certificates curl iproute2 nftables wireguard-tools e2fsprogs tar gzip util-linux kmod lxcfs >/dev/null
 
-for mod in wireguard ifb sch_cake; do
+for mod in wireguard ifb sch_cake tcp_bbr; do
     modprobe "$mod" 2>/dev/null || warn "kernel module $mod is unavailable; related features will fail"
 done
-printf '%s\n' wireguard ifb sch_cake > /etc/modules-load.d/runman.conf
+printf '%s\n' wireguard ifb sch_cake tcp_bbr > /etc/modules-load.d/runman.conf
+
+log "tuning kernel limits"
+# Each instance runs a full init. Their inotify instances, keys and neighbour
+# entries add up on the host (inotify instances of all instances count against
+# one host user: the default of 128 runs out after a handful of instances).
+cat > /etc/sysctl.d/90-runman.conf <<'SYSCTL'
+# Written by the runman installer.
+fs.inotify.max_user_instances = 65536
+fs.inotify.max_user_watches = 4194304
+fs.inotify.max_queued_events = 65536
+kernel.keys.maxkeys = 2000
+kernel.keys.maxbytes = 2000000
+kernel.pid_max = 4194304
+vm.max_map_count = 262144
+net.ipv4.neigh.default.gc_thresh3 = 8192
+net.ipv6.neigh.default.gc_thresh3 = 8192
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+SYSCTL
+sysctl -q -p /etc/sysctl.d/90-runman.conf || warn "some kernel settings could not be applied"
+
+# lxcfs gives instances their own /proc/meminfo, cpuinfo, uptime and load
+# (CPU count from the CPU quota, load average per instance).
+lxcfs_dropin=/etc/systemd/system/lxcfs.service.d/runman.conf
+lxcfs_conf=$(printf '[Service]\nExecStart=\nExecStart=/usr/bin/lxcfs --enable-cfs -l /var/lib/lxcfs')
+if [ "$(cat "$lxcfs_dropin" 2>/dev/null)" != "$lxcfs_conf" ]; then
+    install -d /etc/systemd/system/lxcfs.service.d
+    printf '%s\n' "$lxcfs_conf" > "$lxcfs_dropin"
+    systemctl daemon-reload
+    # Restarting lxcfs detaches the views of running instances until they
+    # restart, so only do it when its options actually change.
+    systemctl restart lxcfs.service
+fi
+systemctl enable --now lxcfs.service >/dev/null 2>&1 || warn "lxcfs is not running; instances will see host-wide /proc values"
 
 # ── binaries ────────────────────────────────────────────────────────────────
 
@@ -356,8 +391,8 @@ log "starting runman-agent"
 cat > /etc/systemd/system/runman-agent.service <<EOF
 [Unit]
 Description=Runman node agent
-After=network-online.target nftables.service
-Wants=network-online.target
+After=network-online.target nftables.service lxcfs.service
+Wants=network-online.target lxcfs.service
 
 [Service]
 ExecStart=$BIN --config $CONFIG

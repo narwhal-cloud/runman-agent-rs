@@ -137,7 +137,7 @@ fn boot_once(
         Some(spec.uid_base + TTY_GID),
     )?;
     let slave_path = nix::unistd::ttyname(&pty.slave)?;
-    cg.create_ct(spec.uid_base)?;
+    cg.create_ct(spec.uid_base, spec.cpus)?;
 
     let (to_child_r, to_child_w) = pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
     let (from_child_r, from_child_w) = pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
@@ -440,6 +440,87 @@ fn setup_dev(rootfs: &Path, console: &Path, tun: bool) -> Result<()> {
     Ok(())
 }
 
+const LXCFS: &str = "/var/lib/lxcfs";
+
+/// Files whose host-wide view lxcfs replaces with the instance's own
+/// (memory and CPU limits, uptime, load). Skipped when lxcfs is not running.
+const LXCFS_PROC: &[&str] = &[
+    "cpuinfo",
+    "diskstats",
+    "loadavg",
+    "meminfo",
+    "stat",
+    "swaps",
+    "uptime",
+    "slabinfo",
+];
+
+fn lxcfs_views(rootfs: &Path) {
+    let bind = |src: &Path, dst: &Path| {
+        if src.exists() && dst.exists() {
+            if let Err(e) = mount(Some(src), dst, None::<&str>, MsFlags::MS_BIND, None::<&str>) {
+                eprintln!("supervisor: lxcfs bind {}: {e}", dst.display());
+            }
+        }
+    };
+    let lxcfs = Path::new(LXCFS);
+    if !lxcfs.join("proc/meminfo").exists() {
+        return;
+    }
+    for f in LXCFS_PROC {
+        bind(&lxcfs.join("proc").join(f), &rootfs.join("proc").join(f));
+    }
+    bind(
+        &lxcfs.join("sys/devices/system/cpu"),
+        &rootfs.join("sys/devices/system/cpu"),
+    );
+}
+
+/// Hide host information that procfs/sysfs expose regardless of namespaces
+/// (the same list Docker masks): timers and scheduler state of host
+/// processes, kernel keys, firmware tables.
+fn mask_host_info(rootfs: &Path) -> Result<()> {
+    let null = rootfs.join("dev/null");
+    for f in [
+        "kcore",
+        "keys",
+        "latency_stats",
+        "timer_list",
+        "timer_stats",
+        "sched_debug",
+        "sysrq-trigger",
+    ] {
+        let p = rootfs.join("proc").join(f);
+        if p.is_file() {
+            mount(
+                Some(&null),
+                &p,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .with_context(|| format!("mask /proc/{f}"))?;
+        }
+    }
+    let hide = |p: PathBuf| -> Result<()> {
+        if p.is_dir() {
+            mount(
+                Some("tmpfs"),
+                &p,
+                Some("tmpfs"),
+                MsFlags::MS_RDONLY,
+                Some("size=0"),
+            )
+            .with_context(|| format!("mask {}", p.display()))?;
+        }
+        Ok(())
+    };
+    for d in ["acpi", "scsi", "asound"] {
+        hide(rootfs.join("proc").join(d))?;
+    }
+    hide(rootfs.join("sys/firmware"))
+}
+
 fn pid1(rootfs: &Path, rx: &mut File, console: &OwnedFd) -> ! {
     let res = (|| -> Result<()> {
         let hard = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
@@ -467,6 +548,8 @@ fn pid1(rootfs: &Path, rx: &mut File, console: &OwnedFd) -> ! {
             None::<&str>,
         )
         .context("mount cgroup2")?;
+        lxcfs_views(rootfs);
+        mask_host_info(rootfs).context("mask /proc and /sys")?;
         nix::unistd::chdir(rootfs)?;
         sys::pivot_root_here().context("pivot_root")?;
         nix::unistd::chdir("/")?;
@@ -483,6 +566,7 @@ fn pid1(rootfs: &Path, rx: &mut File, console: &OwnedFd) -> ! {
         }
         unsafe { libc::ioctl(0, libc::TIOCSCTTY, 0) };
         sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None)?;
+        super::seccomp::install().context("install seccomp filter")?;
 
         let init = CString::new("/sbin/init")?;
         let env = [
@@ -533,10 +617,16 @@ impl Cgroups {
         self.unit.join("ct")
     }
 
-    fn create_ct(&self, uid: u32) -> Result<()> {
+    fn create_ct(&self, uid: u32, cpus: u32) -> Result<()> {
         self.destroy_ct()?;
         let ct = self.ct();
         fs::create_dir(&ct)?;
+        if cpus > 0 {
+            // lxcfs derives the CPU count in /proc/cpuinfo from the cgroup
+            // namespace root's own cpu.max, not from its ancestors.
+            fs::write(ct.join("cpu.max"), format!("{} 100000", cpus * 100_000))
+                .context("set cpu.max")?;
+        }
         // Delegate the subtree to the container's root user.
         for f in [
             "",
