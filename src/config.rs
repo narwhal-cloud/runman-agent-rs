@@ -32,6 +32,10 @@ pub struct Config {
     pub image_base_url: String,
     /// Expose /dev/net/tun to instances.
     pub tun: bool,
+    /// `fixed`: monthly traffic restarts for every instance on
+    /// `traffic_reset_day`; `creation`: monthly on each instance's creation
+    /// day and time.
+    pub traffic_reset_mode: crate::traffic::ResetMode,
     /// Day of month (1-28) on which monthly traffic counters restart.
     pub traffic_reset_day: u32,
     /// UTC offset (`+08:00`) whose midnight starts the reset day.
@@ -113,6 +117,7 @@ impl Default for Config {
             backend: BackendKind::Container,
             image_base_url: DEFAULT_IMAGE_BASE_URL.into(),
             tun: true,
+            traffic_reset_mode: crate::traffic::ResetMode::Fixed,
             traffic_reset_day: 1,
             traffic_timezone: "+00:00".into(),
             bandwidth_mbps: 0,
@@ -160,6 +165,7 @@ impl Config {
     /// When monthly traffic restarts.
     pub fn traffic_schedule(&self) -> crate::traffic::Schedule {
         crate::traffic::Schedule {
+            mode: self.traffic_reset_mode,
             reset_day: self.traffic_reset_day,
             utc_offset_min: parse_utc_offset(&self.traffic_timezone).unwrap_or(0),
         }

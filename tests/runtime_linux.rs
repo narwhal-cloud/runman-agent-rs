@@ -127,6 +127,7 @@ async fn instance_lifecycle() {
             ..Default::default()
         },
         traffic: runman_agent::traffic::Schedule {
+            mode: runman_agent::traffic::ResetMode::Fixed,
             reset_day: 1,
             utc_offset_min: 0,
         },
@@ -519,6 +520,7 @@ async fn side_runtime(name: &str, network: NetworkConfig) -> Runtime {
         tun: true,
         network,
         traffic: runman_agent::traffic::Schedule {
+            mode: runman_agent::traffic::ResetMode::Fixed,
             reset_day: 1,
             utc_offset_min: 0,
         },
@@ -812,6 +814,7 @@ async fn wireguard_dedicated_ips() {
             ..Default::default()
         },
         traffic: runman_agent::traffic::Schedule {
+            mode: runman_agent::traffic::ResetMode::Fixed,
             reset_day: 1,
             utc_offset_min: 0,
         },

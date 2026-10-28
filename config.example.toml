@@ -10,6 +10,7 @@ data_dir = "/var/lib/runman-agent"
 backend = "container"       # "fake" = in-memory, for development only
 image_base_url = "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/images"
 tun = true                  # expose /dev/net/tun to instances
+traffic_reset_mode = "fixed" # "fixed": all instances on traffic_reset_day; "creation": each on its creation day
 traffic_reset_day = 1       # day of month (1-28) monthly traffic starts again
 traffic_timezone = "+00:00" # UTC offset whose midnight starts that day, e.g. "+08:00"
 bandwidth_mbps = 0          # 0 = report the speed test; else a correction (max 2x the test)

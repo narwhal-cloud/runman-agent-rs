@@ -108,6 +108,11 @@ struct Record {
     /// heartbeats (the platform would delete it as an orphan).
     #[serde(default)]
     builder: bool,
+    /// Unix time of the first create (kept across reinstalls); aligns
+    /// traffic periods in `creation` reset mode. 0 in records of older
+    /// agents until `init` fills it in.
+    #[serde(default)]
+    created: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +306,16 @@ impl Runtime {
             self.net.enable_v6().await?;
         }
         self.reconcile_network().await?;
+        // Records of older agents have no creation time: take the instance
+        // directory's (its birth time where the filesystem records one).
+        for mut rec in self.records()?.into_iter().filter(|r| r.created == 0) {
+            let meta = std::fs::metadata(self.dir(&rec.id))?;
+            let born = meta.created().or_else(|_| meta.modified())?;
+            rec.created = born
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or_else(|_| unix_now(), |d| d.as_secs());
+            self.save(&rec)?;
+        }
         // Builds do not survive a restart; drop their temporary instances.
         for rec in self.records()?.into_iter().filter(|r| r.builder) {
             let id = VmId::parse(&rec.id).expect("record ids are validated");
@@ -722,32 +737,22 @@ impl Runtime {
         };
         if wanted != *seen {
             let now = unix_now();
-            let (old, new) = (seen.period(now), wanted.period(now));
             info!(
-                "traffic schedule: day {} UTC{:+}min",
-                wanted.reset_day, wanted.utc_offset_min
+                "traffic schedule: {:?}, day {}, UTC{:+}min",
+                wanted.mode, wanted.reset_day, wanted.utc_offset_min
             );
-            if old != new {
-                for rec in self.records().unwrap_or_default() {
-                    let mut t = self.load_traffic(&rec.id);
-                    if t.period == old {
-                        t.period = new.clone();
-                        self.save_traffic(&rec.id, &t);
-                    }
+            for rec in self.records().unwrap_or_default() {
+                let old = seen.period(rec.created, now);
+                let new = wanted.period(rec.created, now);
+                let mut t = self.load_traffic(&rec.id);
+                if old != new && t.period == old {
+                    t.period = new;
+                    self.save_traffic(&rec.id, &t);
                 }
             }
             *seen = wanted;
         }
         seen
-    }
-
-    fn period(&self) -> String {
-        self.traffic_schedule().period(unix_now())
-    }
-
-    /// When the current traffic period ends (unix time).
-    pub fn next_traffic_reset(&self) -> u64 {
-        self.traffic_schedule().next_reset(unix_now())
     }
 
     fn save_traffic(&self, id: &str, t: &Traffic) {
@@ -771,9 +776,10 @@ impl Runtime {
     /// totals of deleted instances are discarded with them).
     pub async fn sample_traffic(&self) {
         let schedule = self.traffic_schedule();
-        let period = schedule.period(unix_now());
+        let now = unix_now();
         let Ok(records) = self.records() else { return };
         for rec in records {
+            let period = schedule.period(rec.created, now);
             let base = Path::new("/sys/class/net").join(self.net.host_if(rec.idx));
             let read = |name: &str| -> Option<u64> {
                 std::fs::read_to_string(base.join(name))
@@ -899,10 +905,22 @@ impl Runtime {
     /// `create` with the instance lock held.
     async fn create_locked(&self, spec: &InstanceSpec, builder: bool) -> Result<()> {
         let id = spec.vm_id.as_str();
-        if self.load(id)?.is_some() || self.dir(id).exists() {
+        // Replacing an instance (reinstall, or a repeated create) keeps its
+        // creation time and traffic counters: a reinstall must not hand out
+        // a fresh monthly quota.
+        let mut carried = None;
+        if let Some(old) = self.load(id)? {
+            carried = Some((old.created, self.load_traffic(id)));
+        }
+        if carried.is_some() || self.dir(id).exists() {
             info!("create {id}: replacing existing instance");
             self.delete_locked(&spec.vm_id).await?;
         }
+        let (created, traffic) = match carried {
+            Some((c, t)) if c > 0 => (c, Some(t)),
+            Some((_, t)) => (unix_now(), Some(t)),
+            None => (unix_now(), None),
+        };
         // Choosing an index and writing the record that claims it must be one
         // step: creates of different instances run concurrently, and two of
         // them picking the same free index would share a veth name and
@@ -926,9 +944,13 @@ impl Runtime {
             addrs: self.net.addrs_for(idx)?,
             desired: Desired::Running,
             builder,
+            created,
         };
         mkdir_private(&self.dir(id))?;
         self.save(&rec)?;
+        if let Some(t) = &traffic {
+            self.save_traffic(id, t);
+        }
         drop(alloc);
         let started = Instant::now();
         if let Err(e) = self.provision(&rec, &spec.root_password).await {
@@ -1030,11 +1052,12 @@ impl Instances for Runtime {
     }
 
     async fn list(&self) -> Result<Vec<proto::VmSummary>> {
-        let period = self.period();
+        let schedule = *self.traffic_schedule();
+        let now = unix_now();
         let mut out = Vec::new();
         for rec in self.records()?.into_iter().filter(|r| !r.builder) {
             let active = unit_running(&rec.id);
-            out.push(self.summary(&rec, active, &period));
+            out.push(self.summary(&rec, active, &schedule.period(rec.created, now)));
         }
         Ok(out)
     }
@@ -1052,11 +1075,15 @@ impl Instances for Runtime {
     }
 
     async fn details(&self) -> Result<Vec<InstanceDetails>> {
-        let period = self.period();
+        let schedule = *self.traffic_schedule();
+        let now = unix_now();
         let mut out = Vec::new();
         for rec in self.records()?.into_iter().filter(|r| !r.builder) {
             let active = unit_running(&rec.id);
+            let period = schedule.period(rec.created, now);
             let mut d = InstanceDetails::from_summary(&self.summary(&rec, active, &period));
+            d.created = rec.created;
+            d.traffic_next_reset = schedule.next_reset(rec.created, now);
             d.hostname = rec.hostname.clone();
             d.cpu = rec.cpu;
             d.ram_mb = rec.ram_mb;

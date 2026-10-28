@@ -240,6 +240,9 @@ function updateInfo(u) {
     + (u.last_error ? `<div class="muted">${esc(u.last_error)}</div>` : '')
     + '<button class="btn" id="update-now" style="margin-top:6px">检查并更新</button>';
 }
+$('#tab-settings').addEventListener('change', e => {
+  if (e.target.name === 'traffic_reset_mode') $('#reset-day-field').classList.toggle('hidden', e.target.value === 'creation');
+});
 $('#tab-settings').addEventListener('click', async e => {
   if (e.target.id !== 'speedtest-run') return;
   e.target.disabled = true; e.target.textContent = '测速中，最长约 1 分钟…';
@@ -288,7 +291,9 @@ async function loadInstances() {
       : '<p class="muted">此节点由平台管理：新建、删除、重装和端口转发请在平台上操作。</p>';
     if (!list.length) { el.innerHTML = head + '<p class="muted section">此节点上还没有实例。</p>'; return; }
     el.innerHTML = head + `<div class="table-wrap section"><table>
-      <tr><th>实例</th><th>状态</th><th>规格</th><th>地址</th><th>端口转发</th><th title="下次重置：${esc(nextResetText(node.traffic))}">本月流量<div class="muted" style="font-weight:normal">${node.traffic ? esc(atOffset(node.traffic.next_reset, node.traffic.timezone).slice(5, 10)) + ' 重置' : ''}</div></th><th>操作</th></tr>
+      <tr><th>实例</th><th>状态</th><th>规格</th><th>地址</th><th>端口转发</th>${node.traffic && node.traffic.mode === 'fixed'
+        ? `<th title="下次重置：${esc(nextResetText(node.traffic))}">本月流量<div class="muted" style="font-weight:normal">${esc(atOffset(node.traffic.next_reset, node.traffic.timezone).slice(5, 10))} 重置</div></th>`
+        : '<th title="每个实例在自己的创建日重置">本月流量</th>'}<th>操作</th></tr>
       ${list.map(i => `<tr data-id="${esc(i.id)}">
         <td><div>${esc(i.hostname || '-')}</div><div class="muted mono">${esc(i.id)}</div><div class="muted">${esc(i.os_image)}</div></td>
         <td><span class="badge ${esc(i.status)}">${esc({running:'运行中',stopped:'已停止',creating:'创建中',error:'异常'}[i.status] || i.status)}</span>
@@ -296,7 +301,8 @@ async function loadInstances() {
         <td>${i.cpu} 核 / ${i.ram_mb} MB<br>${i.disk_gb} GB · ${i.bandwidth_mbps ? i.bandwidth_mbps + ' Mbps' : '不限速'}</td>
         <td class="mono">${i.ips.map(esc).join('<br>')}${i.dedicated.length ? '<br><span class="badge ok">独立 IP</span><br>' + i.dedicated.map(esc).join('<br>') : ''}</td>
         <td class="mono">${forwardsCell(i)}</td>
-        <td>↓ ${bytes(i.month_in)}<br>↑ ${bytes(i.month_out)}</td>
+        <td>↓ ${bytes(i.month_in)}<br>↑ ${bytes(i.month_out)}${node.traffic && node.traffic.mode === 'creation' && i.traffic_next_reset
+          ? `<div class="muted" title="${esc(atOffset(i.traffic_next_reset, node.traffic.timezone))}（UTC${esc(node.traffic.timezone)}）">${esc(atOffset(i.traffic_next_reset, node.traffic.timezone).slice(5, 10))} 重置</div>` : ''}</td>
         <td><div class="actions">
           ${i.status === 'running'
             ? `<button class="btn" data-act="console">终端</button><button class="btn" data-act="restart">重启</button><button class="btn" data-act="stop">关机</button><button class="btn danger" data-act="force_stop">强制关机</button>`
@@ -652,14 +658,22 @@ async function loadSettings() {
       <div class="card section"><h2>节点带宽</h2>${bandwidthCard(s.bandwidth)}</div>
       <div class="card section"><h2>流量统计</h2>
         <form class="row" id="traffic-form">
-          <label>每月重置日<select name="traffic_reset_day">${Array.from({ length: 28 }, (_, i) => i + 1).map(d => `<option value="${d}"${d === s.traffic.reset_day ? ' selected' : ''}>${d} 号</option>`).join('')}</select></label>
+          <label>重置方式<select name="traffic_reset_mode">
+            <option value="fixed"${s.traffic.mode === 'fixed' ? ' selected' : ''}>统一重置日（所有实例同一天）</option>
+            <option value="creation"${s.traffic.mode === 'creation' ? ' selected' : ''}>按创建日（每个实例在自己的创建日重置）</option>
+          </select></label>
+          <label${s.traffic.mode === 'creation' ? ' class="hidden"' : ''} id="reset-day-field">每月重置日<select name="traffic_reset_day">${Array.from({ length: 28 }, (_, i) => i + 1).map(d => `<option value="${d}"${d === s.traffic.reset_day ? ' selected' : ''}>${d} 号</option>`).join('')}</select></label>
           <label>时区<select name="traffic_timezone">${(TIMEZONES.some(([z]) => z === s.traffic.timezone) ? TIMEZONES : [[s.traffic.timezone, '当前配置'], ...TIMEZONES])
             .map(([z, n]) => `<option value="${z}"${z === s.traffic.timezone ? ' selected' : ''}>UTC${z} ${esc(n)}</option>`).join('')}</select></label>
           <button class="btn primary">保存</button>
         </form>
-        <div class="kv section"><span class="muted">下次重置</span><span>${esc(nextResetText(s.traffic))}</span></div>
-        <p class="muted">每个实例的「本月流量」在重置日当天 00:00（所选时区）归零，累计流量不受影响。整台节点使用同一个重置日；最多可选 28 号，保证每个月都有这一天。
-          平台按本月入站 + 出站之和判断是否超出套餐流量。修改设置不会清空当前周期已用的流量，它们会在新的重置时间到来时归零。</p>
+        ${s.traffic.mode === 'fixed'
+          ? `<div class="kv section"><span class="muted">下次重置</span><span>${esc(nextResetText(s.traffic))}</span></div>`
+          : '<p class="section">每个实例的下次重置时间显示在「实例」列表的「本月流量」一栏。</p>'}
+        <p class="muted"><strong>统一重置日</strong>：所有实例的「本月流量」在每月同一天的 00:00（所选时区）归零，最多可选 28 号，保证每个月都有这一天。<br>
+          <strong>按创建日</strong>：每个实例在每月与创建时相同的日期和时刻归零，比如 10 月 15 日 09:30 创建的实例，在 11 月 15 日 09:30、12 月 15 日 09:30……重置；
+          29–31 号创建的实例在没有这一天的月份改为月末重置。重装系统不会改变创建时间，也不会清空已用流量。<br>
+          累计流量不受影响。平台按本月入站 + 出站之和判断是否超出套餐流量。修改设置不会清空当前周期已用的流量，它们会在新的重置时间到来时归零。</p>
       </div>
       <div class="card section"><h2>面板密码</h2>
         <form class="row" id="password-form">
@@ -700,7 +714,7 @@ $('#tab-settings').addEventListener('submit', async e => {
       await api('/api/settings', { method: 'PUT', body: { bandwidth_mbps: +f.get('bandwidth_mbps') } });
       toast('带宽已保存');
     } else if (e.target.id === 'traffic-form') {
-      await api('/api/settings', { method: 'PUT', body: { traffic_reset_day: +f.get('traffic_reset_day'), traffic_timezone: f.get('traffic_timezone') } });
+      await api('/api/settings', { method: 'PUT', body: { traffic_reset_mode: f.get('traffic_reset_mode'), traffic_reset_day: +f.get('traffic_reset_day'), traffic_timezone: f.get('traffic_timezone') } });
       toast('流量重置设置已保存');
     } else if (e.target.id === 'password-form') {
       await api('/api/settings/password', { method: 'POST', body: { old_password: f.get('old_password'), new_password: f.get('new_password') } });

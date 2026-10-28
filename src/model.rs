@@ -219,6 +219,10 @@ pub struct InstanceDetails {
     pub traffic_out: i64,
     pub month_in: i64,
     pub month_out: i64,
+    /// Unix time the instance was created (0 = unknown).
+    pub created: u64,
+    /// Unix time its monthly traffic restarts (0 = unknown).
+    pub traffic_next_reset: u64,
 }
 
 impl InstanceDetails {

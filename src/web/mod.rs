@@ -385,9 +385,11 @@ fn traffic_info(cfg: &config::Config) -> Value {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     json!({
+        "mode": cfg.traffic_reset_mode,
         "reset_day": cfg.traffic_reset_day,
         "timezone": cfg.traffic_timezone,
-        "next_reset": cfg.traffic_schedule().next_reset(now),
+        // Per instance in `creation` mode (see the instance list).
+        "next_reset": cfg.traffic_schedule().next_reset(0, now),
     })
 }
 
@@ -856,6 +858,7 @@ async fn run_speedtest(State(web): State<Arc<Web>>) -> ApiResult<Json<Value>> {
 struct SettingsReq {
     host: Option<String>,
     bandwidth_mbps: Option<u32>,
+    traffic_reset_mode: Option<crate::traffic::ResetMode>,
     traffic_reset_day: Option<u32>,
     traffic_timezone: Option<String>,
 }
@@ -892,6 +895,9 @@ async fn put_settings(
         }
         if let Some(b) = req.bandwidth_mbps {
             c.bandwidth_mbps = b;
+        }
+        if let Some(m) = req.traffic_reset_mode {
+            c.traffic_reset_mode = m;
         }
         if let Some(d) = req.traffic_reset_day {
             c.traffic_reset_day = d;

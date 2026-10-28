@@ -47,7 +47,11 @@ bash install.sh --token '<平台下发的 Token>'      # 接入平台
 - **接入或断开平台**：`runman-agent set-token '<Token>'` / `runman-agent set-token --clear`，然后执行 `systemctl restart runman-agent`；也可以在面板「设置」里操作（立即生效）。节点上已有本地实例时接入平台要谨慎：平台会删除它数据库里没有的实例。
 
 - **节点带宽**：agent 首次启动时向 Cloudflare 测速一次，之后不再自动测速（8 路并发，每个方向两轮取较好的一轮，最多约 800 MB），把上下行中较小的值上报平台，平台据此限制可售套餐的带宽上限。测速可能偏低，可以在面板「设置 → 节点带宽」里修正：可以改成任意更低的值，最高为测速结果的 2 倍；需要重新测速时点面板里的「重新测速」，或在节点上执行 `runman-agent speedtest`（之后重启 agent 生效）。
-- **流量重置**：实例的本月流量在每月 `traffic_reset_day` 号 00:00 清零（默认 1 号，时区 `traffic_timezone` 默认 `+00:00`，国内节点一般设成 `+08:00`），在面板「设置 → 流量统计」中修改立即生效，当前周期已用的流量会保留到新的重置时间。
+- **流量重置**：两种方式，在面板「设置 → 流量统计」中切换，立即生效，当前周期已用的流量会保留到新的重置时间：
+  - 统一重置日（`traffic_reset_mode = "fixed"`，默认）：所有实例在每月 `traffic_reset_day` 号 00:00 清零（默认 1 号）；
+  - 按创建日（`"creation"`）：每个实例在每月与创建时相同的日期和时刻清零，29–31 号创建的在短月份改为月末。
+
+  时区由 `traffic_timezone` 指定（默认 `+00:00`，国内节点一般设成 `+08:00`）。重装系统保留创建时间和已用流量，不会重置额度。
 
 配置文件为 `/etc/runman-agent/config.toml`，全部配置项见 [config.example.toml](config.example.toml)。
 

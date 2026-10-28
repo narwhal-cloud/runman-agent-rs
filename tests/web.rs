@@ -712,6 +712,21 @@ async fn traffic_schedule_settings() {
     assert!(next > now && next - now <= 31 * 86_400);
     // Midnight in UTC+8 is 16:00 UTC.
     assert_eq!(next % 86_400, 16 * 3600);
+
+    let r = put(json!({"traffic_reset_mode": "creation"}))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        p.store.get().traffic_reset_mode,
+        runman_agent::traffic::ResetMode::Creation
+    );
+    let r = put(json!({"traffic_reset_mode": "weekly"})).await.unwrap();
+    assert!(r.status().is_client_error());
+    assert_eq!(
+        p.store.get().traffic_reset_mode,
+        runman_agent::traffic::ResetMode::Creation
+    );
 }
 
 #[tokio::test]
