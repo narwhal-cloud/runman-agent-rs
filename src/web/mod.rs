@@ -132,6 +132,8 @@ impl Web {
                 axum::routing::delete(delete_forward),
             )
             .route("/api/wg", get(list_wg).post(add_wg))
+            .route("/api/monitor", get(monitor_usage))
+            .route("/api/monitor/{id}", get(monitor_series))
             .route("/api/images", get(list_images))
             .route("/api/images/{id}", axum::routing::delete(delete_image))
             .route("/api/images/builds", get(list_builds).post(start_build))
@@ -766,6 +768,73 @@ async fn delete_wg(
     }
     web.local_wg.apply(web.services.wg.as_ref()).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ── monitoring ──────────────────────────────────────────────────────────────
+
+fn monitor(web: &Web) -> ApiResult<&Arc<dyn crate::backend::Monitor>> {
+    web.services.monitor.as_ref().ok_or_else(|| {
+        err(
+            StatusCode::NOT_IMPLEMENTED,
+            "this backend keeps no resource history",
+        )
+    })
+}
+
+#[derive(Deserialize)]
+struct WindowQuery {
+    /// Seconds.
+    #[serde(default = "default_window")]
+    window: u64,
+}
+
+fn default_window() -> u64 {
+    3600
+}
+
+/// Every instance with its averages over the window, for ranking.
+async fn monitor_usage(
+    State(web): State<Arc<Web>>,
+    Query(q): Query<WindowQuery>,
+) -> ApiResult<Json<Value>> {
+    if q.window == 0 || q.window > crate::history::RAW_KEEP {
+        return Err(err(StatusCode::BAD_REQUEST, "window must be 1 s to 48 h"));
+    }
+    let usage = monitor(&web)?.usage(q.window).await?;
+    let details = web.services.instances.details().await?;
+    let list: Vec<Value> = details
+        .into_iter()
+        .map(|d| {
+            let u = usage.iter().find(|u| u.vm_id == d.id);
+            json!({
+                "id": d.id, "hostname": d.hostname, "status": d.status,
+                "cpu": d.cpu, "ram_mb": d.ram_mb, "disk_gb": d.disk_gb,
+                "bandwidth_mbps": d.bandwidth_mbps,
+                "usage": u,
+            })
+        })
+        .collect();
+    Ok(Json(json!(list)))
+}
+
+#[derive(Deserialize)]
+struct RangeQuery {
+    /// Seconds.
+    #[serde(default = "default_window")]
+    range: u64,
+}
+
+async fn monitor_series(
+    State(web): State<Arc<Web>>,
+    Path(id): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> ApiResult<Json<Value>> {
+    let id = vm(&id)?;
+    let points = monitor(&web)?
+        .series(id.as_str(), q.range)
+        .await
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(json!({ "points": points })))
 }
 
 // ── images ──────────────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ Token 只由平台生成，agent 和安装器从不自行生成。
 ## 功能
 
 - **系统容器运行时**：每个实例独立的 user namespace（UID 段互不重叠）、cgroup v2 资源限制、按套餐大小的 ext4 磁盘、共享只读镜像模板；创建约 0.3 s，实例内 reboot 自动重启，`/dev/net/tun` 可用。
+- **资源监控**：每分钟记录每个实例的 CPU、内存、磁盘占用、磁盘读写与 IOPS、网络流量与包速，存在本地 SQLite（`<data_dir>/metrics.db`，分钟级数据保留 48 小时，10 分钟汇总保留 30 天）。面板「监控」页按最近 5 分钟 / 1 小时 / 24 小时的平均值给实例排序并标出异常，便于发现滥用；每个实例都可以看历史图表。
 - **网络**：NAT4、端口转发（含新建实例自动分配的 SSH 端口）、实例间隔离与防地址伪造、上下行限速、流量统计；IPv6 支持 `none` / `snat` / `subnet`（同链路 /64 经 NDP 代理或路由前缀）。
 - **WireGuard 独立 IP**：宿主机内核 WireGuard，独立 IPv4/IPv6 直接配在实例 `eth0` 上，出站、入站、监听都用它；私钥不进实例。
 - **管理面板**（`:8792`）：节点概览、实例操作、浏览器终端、rfw 防火墙规则、Token 轮换。
@@ -114,7 +115,8 @@ sudo cargo test --release --test runtime_linux -- --ignored --test-threads=1
 ```
 proto/agent.proto     与平台共用的协议（不要修改）
 src/platform/         gRPC 会话、命令执行、控制台路由
-src/runtime/          容器运行时：supervisor、镜像、网络、WireGuard、流量统计
+src/runtime/          容器运行时：supervisor、镜像、网络、WireGuard、流量统计、资源采样
+src/history.rs        资源历史（SQLite）
 src/web/              管理面板（ui.html 内嵌进二进制）
 src/updater.rs        自更新
 src/detect.rs         IPv6 模式探测（install.sh 使用）

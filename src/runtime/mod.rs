@@ -17,6 +17,7 @@ pub mod customize;
 pub mod exec;
 pub mod fsutil;
 pub mod image;
+pub mod monitor;
 pub mod net;
 pub mod seccomp;
 pub mod spec;
@@ -150,6 +151,10 @@ pub struct Runtime {
     vm_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Serializes instance index allocation (see `create_locked`).
     alloc: Mutex<()>,
+    /// Resource history (`metrics.db`) and the previous counter readings
+    /// its rates are computed from.
+    history: Arc<crate::history::History>,
+    monitor_prev: Mutex<HashMap<String, monitor::Counters>>,
     builds: build::Builds,
 }
 
@@ -190,6 +195,8 @@ impl Runtime {
             net_pending: Mutex::default(),
             vm_locks: Mutex::default(),
             alloc: Mutex::default(),
+            history: Arc::new(crate::history::History::open(&data_dir.join("metrics.db"))?),
+            monitor_prev: Mutex::default(),
             builds: build::Builds::new(&data_dir.join("image-builds"))?,
         })
     }
@@ -1031,7 +1038,12 @@ impl Instances for Runtime {
 
     async fn delete(&self, id: &VmId) -> Result<()> {
         let _g = self.lock_vm(id.as_str()).await;
-        self.delete_locked(id).await
+        self.delete_locked(id).await?;
+        // A reinstall (delete_locked + create) keeps the history.
+        if let Err(e) = self.history.forget(id.as_str()) {
+            warn!("instance {id}: drop metrics: {e:#}");
+        }
+        Ok(())
     }
 
     async fn reset_password(&self, id: &VmId, password: &str) -> Result<()> {

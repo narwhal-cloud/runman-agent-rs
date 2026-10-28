@@ -181,10 +181,9 @@ impl Mock {
             if let Event::Msg(AgentEnvelope {
                 payload: Some(p), ..
             }) = self.next(left).await
+                && let Some(v) = pred(&p)
             {
-                if let Some(v) = pred(&p) {
-                    return v;
-                }
+                return v;
             }
         }
     }

@@ -2,7 +2,7 @@
 name = "runman-agent"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Runman node agent: system-container runtime managed by the Narwhal Cloud platform"
 license = "MIT"
 
@@ -38,6 +38,7 @@ tonic-prost = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 uuid = { version = "1.18.1", features = ["v4"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "cookies"] }

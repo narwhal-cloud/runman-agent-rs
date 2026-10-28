@@ -34,6 +34,15 @@ main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 60px; }
 table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { font-weight: 500; color: var(--muted); font-size: 12px; background: var(--code); }
+th.sortable { cursor: pointer; user-select: none; }
+th.sorted { color: var(--text); }
+td.hot { color: var(--bad); font-weight: 600; }
+td.warm { color: var(--warn); }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.chart h4 { margin: 0 0 4px; font-size: 13px; font-weight: 500; }
+.chart canvas { width: 100%; height: 150px; display: block; }
+.legend { font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 10px; height: 3px; margin: 0 4px 2px 8px; vertical-align: middle; }
 tr:last-child td { border-bottom: 0; }
 .table-wrap { overflow-x: auto; }
 code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
@@ -84,6 +93,7 @@ pre.log { max-height: 65vh; overflow: auto; background: var(--code); padding: 10
       <button data-tab="overview" class="active">概览</button>
       <button data-tab="instances">实例</button>
       <button data-tab="wg">独立 IP</button>
+      <button data-tab="monitor">监控</button>
       <button data-tab="images">镜像</button>
       <button data-tab="firewall">防火墙</button>
       <button data-tab="settings">设置</button>
@@ -95,6 +105,7 @@ pre.log { max-height: 65vh; overflow: auto; background: var(--code); padding: 10
     <section id="tab-overview"></section>
     <section id="tab-instances" class="hidden"></section>
     <section id="tab-wg" class="hidden"></section>
+    <section id="tab-monitor" class="hidden"></section>
     <section id="tab-images" class="hidden"></section>
     <section id="tab-firewall" class="hidden"></section>
     <section id="tab-settings" class="hidden"></section>
@@ -196,9 +207,10 @@ function switchTab(tab) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('main > section').forEach(s => s.classList.toggle('hidden', s.id !== 'tab-' + tab));
   clearInterval(timer);
-  const load = { overview: loadOverview, instances: loadInstances, wg: loadWg, images: loadImages, firewall: loadFirewall, settings: loadSettings }[tab];
+  const load = { overview: loadOverview, instances: loadInstances, wg: loadWg, monitor: loadMonitor, images: loadImages, firewall: loadFirewall, settings: loadSettings }[tab];
   load();
   if (tab === 'overview' || tab === 'instances' || tab === 'images') timer = setInterval(load, 10000);
+  if (tab === 'monitor') timer = setInterval(load, 60000);
 }
 
 // ── overview ──
@@ -307,7 +319,7 @@ async function loadInstances() {
           ${i.status === 'running'
             ? `<button class="btn" data-act="console">终端</button><button class="btn" data-act="restart">重启</button><button class="btn" data-act="stop">关机</button><button class="btn danger" data-act="force_stop">强制关机</button>`
             : `<button class="btn primary" data-act="start">开机</button>`}
-          <button class="btn" data-act="password">改密码</button><button class="btn" data-act="log">日志</button>
+          <button class="btn" data-act="password">改密码</button><button class="btn" data-act="log">日志</button><button class="btn" data-act="chart">图表</button>
           ${standalone() ? '<button class="btn" data-act="reinstall">重装</button><button class="btn danger" data-act="delete">删除</button>' : ''}
         </div></td></tr>`).join('')}
     </table></div>`;
@@ -340,6 +352,7 @@ $('#tab-instances').addEventListener('click', async e => {
   const id = b.closest('tr').dataset.id, act = b.dataset.act;
   if (act === 'console') return openConsole(id);
   if (act === 'log') return openLog(id);
+  if (act === 'chart') return showCharts(id);
   try {
     if (act === 'password') {
       const pw = prompt('新的 root 密码'); if (!pw) return;
@@ -371,6 +384,121 @@ $('#tab-instances').addEventListener('click', async e => {
   } catch (err) { toast('失败：' + err.message); }
   loadInstances();
 });
+
+// ── monitoring ──
+const bits = n => { n = Number(n) || 0; const u = ['bit/s', 'Kbit/s', 'Mbit/s', 'Gbit/s']; let i = 0; while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
+const count = n => { n = Number(n) || 0; return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : n.toFixed(n < 10 ? 1 : 0); };
+let monitorWindow = 3600, monitorSort = 'cpu';
+// Sort keys and how a row's value is read.
+const MONITOR_COLS = {
+  cpu: r => r.usage ? r.usage.cpu : -1,
+  mem: r => r.usage ? r.usage.mem / (r.ram_mb * 1048576) : -1,
+  disk: r => r.usage ? r.usage.disk / (r.disk_gb * 1073741824) : -1,
+  io: r => r.usage ? r.usage.rd + r.usage.wr : -1,
+  net: r => r.usage ? r.usage.rx + r.usage.tx : -1,
+  pps: r => r.usage ? r.usage.rxp + r.usage.txp : -1,
+};
+
+async function loadMonitor() {
+  const el = $('#tab-monitor');
+  try {
+    const rows = await api('/api/monitor?window=' + monitorWindow);
+    rows.sort((a, b) => MONITOR_COLS[monitorSort](b) - MONITOR_COLS[monitorSort](a));
+    const th = (key, label) => `<th class="sortable${monitorSort === key ? ' sorted' : ''}" data-sort="${key}">${label}${monitorSort === key ? ' ↓' : ''}</th>`;
+    const cls = (v, warm, hot) => v >= hot ? 'hot' : v >= warm ? 'warm' : '';
+    el.innerHTML = `
+      <div class="row">
+        <label>统计区间<select id="monitor-window">${[[300, '最近 5 分钟'], [3600, '最近 1 小时'], [86400, '最近 24 小时']]
+          .map(([v, n]) => `<option value="${v}"${v === monitorWindow ? ' selected' : ''}>${n}</option>`).join('')}</select></label>
+        <span class="muted">每分钟采样一次，表中是区间内的平均值；点表头排序，点「图表」看历史（最长 30 天）。持续高 CPU、高包速或上行跑满带宽的实例会标出颜色。</span>
+      </div>
+      <div class="table-wrap section"><table>
+        <tr><th>实例</th>${th('cpu', 'CPU')}${th('mem', '内存')}${th('disk', '磁盘')}${th('io', '磁盘读 / 写')}${th('net', '网络入 / 出')}${th('pps', '包速 入 / 出')}<th></th></tr>
+        ${rows.map(r => {
+          const u = r.usage;
+          if (!u) return `<tr data-id="${esc(r.id)}"><td><div>${esc(r.hostname)}</div><div class="muted mono">${esc(r.id)}</div></td><td colspan="6" class="muted">${r.status === 'running' ? '采样中，约 2 分钟后有数据' : '未运行，区间内没有数据'}</td><td><button class="btn" data-act="chart">图表</button></td></tr>`;
+          const memPct = u.mem / (r.ram_mb * 1048576) * 100, diskPct = u.disk / (r.disk_gb * 1073741824) * 100;
+          const upPct = r.bandwidth_mbps ? u.tx / (r.bandwidth_mbps * 1e6) * 100 : 0;
+          return `<tr data-id="${esc(r.id)}">
+            <td><div>${esc(r.hostname)}</div><div class="muted mono">${esc(r.id)}</div></td>
+            <td class="${cls(u.cpu, 60, 90)}">${u.cpu.toFixed(1)}%<div class="muted">峰值 ${u.cpu_max.toFixed(0)}% · ${r.cpu} 核</div></td>
+            <td class="${cls(memPct, 85, 97)}">${bytes(u.mem)}<div class="muted">${memPct.toFixed(0)}% / ${r.ram_mb} MB</div></td>
+            <td class="${cls(diskPct, 85, 95)}">${bytes(u.disk)}<div class="muted">${diskPct.toFixed(0)}% / ${r.disk_gb} GB</div></td>
+            <td class="${cls(u.rio + u.wio, 500, 2000)}">${rate(u.rd)} / ${rate(u.wr)}<div class="muted">${count(u.rio)} / ${count(u.wio)} IOPS</div></td>
+            <td class="${cls(upPct, 70, 90)}">${bits(u.rx)} / ${bits(u.tx)}${r.bandwidth_mbps ? `<div class="muted">限速 ${r.bandwidth_mbps} Mbps</div>` : ''}</td>
+            <td class="${cls(u.rxp + u.txp, 20000, 100000)}">${count(u.rxp)} / ${count(u.txp)} pps</td>
+            <td><button class="btn" data-act="chart">图表</button></td></tr>`;
+        }).join('') || '<tr><td colspan="8" class="muted">此节点上还没有实例。</td></tr>'}
+      </table></div>`;
+  } catch (e) { el.textContent = e.message; }
+}
+
+$('#tab-monitor').addEventListener('change', e => {
+  if (e.target.id === 'monitor-window') { monitorWindow = +e.target.value; loadMonitor(); }
+});
+$('#tab-monitor').addEventListener('click', e => {
+  const th = e.target.closest('th[data-sort]');
+  if (th) { monitorSort = th.dataset.sort; return loadMonitor(); }
+  const b = e.target.closest('button[data-act="chart"]');
+  if (b) showCharts(b.closest('tr').dataset.id);
+});
+
+// Line chart on a canvas: series of [{ts, v}], one or two lines.
+function drawChart(canvas, lines, fmt) {
+  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext('2d'); g.scale(dpr, dpr);
+  const css = getComputedStyle(document.documentElement), color = n => css.getPropertyValue(n).trim();
+  const pts = lines.flatMap(l => l.points);
+  g.font = '11px system-ui, sans-serif'; g.fillStyle = color('--muted');
+  if (!pts.length) { g.fillText('没有数据', w / 2 - 24, h / 2); return; }
+  const t0 = Math.min(...pts.map(p => p.ts)), t1 = Math.max(...pts.map(p => p.ts));
+  const max = Math.max(...pts.map(p => p.v), 1e-9) * 1.1;
+  const L = 64, R = 8, T = 8, B = 18, x = t => L + (t1 > t0 ? (t - t0) / (t1 - t0) : 0.5) * (w - L - R), y = v => T + (1 - v / max) * (h - T - B);
+  g.strokeStyle = color('--line'); g.lineWidth = 1;
+  for (let i = 0; i <= 3; i++) {
+    const v = max * i / 3, yy = Math.round(y(v)) + 0.5;
+    g.beginPath(); g.moveTo(L, yy); g.lineTo(w - R, yy); g.stroke();
+    g.fillText(fmt(v), 4, yy + 4);
+  }
+  const span = t1 - t0, label = t => { const d = new Date(t * 1000); return span > 2 * 86400 ? `${d.getMonth() + 1}-${d.getDate()}` : `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+  g.fillText(label(t0), L, h - 4); const lt = label(t1); g.fillText(lt, w - R - g.measureText(lt).width, h - 4);
+  for (const l of lines) {
+    g.strokeStyle = color(l.color); g.lineWidth = 1.5; g.beginPath();
+    let prev = null;
+    for (const p of l.points) {
+      // Break the line across gaps (instance stopped).
+      if (prev && p.ts - prev.ts > l.gap) g.moveTo(x(p.ts), y(p.v)); else if (prev) g.lineTo(x(p.ts), y(p.v)); else g.moveTo(x(p.ts), y(p.v));
+      prev = p;
+    }
+    g.stroke();
+  }
+}
+
+const CHART_RANGES = [[3600, '1 小时'], [6 * 3600, '6 小时'], [86400, '24 小时'], [7 * 86400, '7 天'], [30 * 86400, '30 天']];
+async function showCharts(id, range = 3600) {
+  dialog('资源历史 · ' + id.slice(0, 8), `
+    <div class="row">${CHART_RANGES.map(([v, n]) => `<button class="btn${v === range ? ' primary' : ''}" data-range="${v}">${n}</button>`).join('')}</div>
+    <div class="charts section" id="charts"><p class="muted">加载中…</p></div>`);
+  $('#dlg-body').onclick = e => { const b = e.target.closest('button[data-range]'); if (b) showCharts(id, +b.dataset.range); };
+  try {
+    const { points } = await api(`/api/monitor/${id}?range=${range}`);
+    const bucket = Math.max(60, range / 360), gap = bucket * 2.5;
+    const s = key => points.map(p => ({ ts: p.ts, v: p[key] }));
+    const charts = [
+      ['CPU（占分配核数）', [{ name: '平均', color: '--accent', points: s('cpu') }, { name: '峰值', color: '--warn', points: s('cpu_max') }], v => v.toFixed(0) + '%'],
+      ['内存', [{ name: '已用', color: '--accent', points: s('mem') }], bytes],
+      ['磁盘已用', [{ name: '已用', color: '--accent', points: s('disk') }], bytes],
+      ['磁盘读写', [{ name: '读', color: '--ok', points: s('rd') }, { name: '写', color: '--warn', points: s('wr') }], v => rate(v)],
+      ['磁盘 IOPS', [{ name: '读', color: '--ok', points: s('rio') }, { name: '写', color: '--warn', points: s('wio') }], count],
+      ['网络', [{ name: '入', color: '--ok', points: s('rx') }, { name: '出', color: '--accent', points: s('tx') }], bits],
+      ['包速', [{ name: '入', color: '--ok', points: s('rxp') }, { name: '出', color: '--accent', points: s('txp') }], v => count(v) + ' pps'],
+    ];
+    const box = $('#charts'); if (!box) return;
+    box.innerHTML = charts.map(([title, lines], i) => `<div class="chart card"><h4>${title}<span class="legend">${lines.map(l => `<i style="background:var(${l.color})"></i>${l.name}`).join('')}</span></h4><canvas id="chart-${i}"></canvas></div>`).join('');
+    charts.forEach(([, lines, fmt], i) => drawChart($('#chart-' + i), lines.map(l => ({ ...l, gap })), fmt));
+  } catch (err) { const box = $('#charts'); if (box) box.innerHTML = `<p class="muted">${esc(err.message)}</p>`; }
+}
 
 // ── images ──
 const EXAMPLE_SCRIPT = `# 以 root 运行，可联网；任一命令失败即构建失败。示例：

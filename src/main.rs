@@ -180,12 +180,26 @@ async fn agent_main() -> Result<()> {
                     }
                 });
             }
+            {
+                let rt = rt.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        rt.sample_history().await;
+                    }
+                });
+            }
             Services {
                 instances: rt.clone(),
                 port_forwards: rt.clone(),
                 wg: rt.clone(),
                 host: Arc::new(ProcMetrics::new(cfg.data_dir.clone())),
-                images: Some(Arc::new(runman_agent::runtime::build::ImageAdminHandle(rt))),
+                images: Some(Arc::new(runman_agent::runtime::build::ImageAdminHandle(
+                    rt.clone(),
+                ))),
+                monitor: Some(Arc::new(runman_agent::runtime::monitor::MonitorHandle(rt))),
             }
         }
     };

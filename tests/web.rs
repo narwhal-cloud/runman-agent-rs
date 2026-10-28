@@ -755,3 +755,17 @@ async fn bandwidth_correction() {
     assert_eq!(s["bandwidth"]["reported"], 5000);
     assert!(s["bandwidth"]["speedtest"]["measured"].is_null());
 }
+
+#[tokio::test]
+async fn monitoring_needs_a_capable_backend() {
+    let p = start().await;
+    let c = client();
+    login(&p, &c, PASSWORD).await;
+    for path in [
+        "/api/monitor",
+        "/api/monitor/11111111-1111-4111-8111-111111111111",
+    ] {
+        let r = c.get(format!("{}{path}", p.base)).send().await.unwrap();
+        assert_eq!(r.status(), 501, "{path}");
+    }
+}

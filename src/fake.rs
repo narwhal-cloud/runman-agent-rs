@@ -48,6 +48,7 @@ impl Fake {
             wg: self.clone(),
             host: self.clone(),
             images: None,
+            monitor: None,
         }
     }
 

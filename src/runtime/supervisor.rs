@@ -457,10 +457,11 @@ const LXCFS_PROC: &[&str] = &[
 
 fn lxcfs_views(rootfs: &Path) {
     let bind = |src: &Path, dst: &Path| {
-        if src.exists() && dst.exists() {
-            if let Err(e) = mount(Some(src), dst, None::<&str>, MsFlags::MS_BIND, None::<&str>) {
-                eprintln!("supervisor: lxcfs bind {}: {e}", dst.display());
-            }
+        if src.exists()
+            && dst.exists()
+            && let Err(e) = mount(Some(src), dst, None::<&str>, MsFlags::MS_BIND, None::<&str>)
+        {
+            eprintln!("supervisor: lxcfs bind {}: {e}", dst.display());
         }
     };
     let lxcfs = Path::new(LXCFS);

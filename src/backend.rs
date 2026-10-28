@@ -103,6 +103,17 @@ pub struct Services {
     pub host: Arc<dyn HostMetrics>,
     /// None for backends without image management (the in-memory fake).
     pub images: Option<Arc<dyn ImageAdmin>>,
+    /// Resource history; None for backends that keep none (the fake).
+    pub monitor: Option<Arc<dyn Monitor>>,
+}
+
+/// Recorded resource usage of instances, for the panel.
+#[async_trait]
+pub trait Monitor: Send + Sync {
+    /// Every instance's averages over the last `window` seconds.
+    async fn usage(&self, window: u64) -> Result<Vec<crate::history::Usage>>;
+    /// Chart points of one instance over the last `range` seconds.
+    async fn series(&self, vm: &str, range: u64) -> Result<Vec<crate::history::Point>>;
 }
 
 /// Every instance gets a random host port forwarded to SSH (22/tcp), as the
