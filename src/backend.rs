@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::model::{
-    BuildInfo, BuildRequest, ConsoleSize, HostSnapshot, ImageInfo, InstanceDetails, InstanceSpec,
-    L4Proto, PortForward, VmId,
+    BuildInfo, BuildRequest, ConsoleSize, HostSnapshot, ImageInfo, ImageSettings, InstanceDetails,
+    InstanceSpec, L4Proto, PortForward, VmId,
 };
 use crate::proto;
 
@@ -92,6 +92,9 @@ pub trait ImageAdmin: Send + Sync {
     fn build_log(&self, build_id: &str) -> Result<String>;
     /// Stop offering a custom image (files go once no instance uses them).
     async fn delete_image(&self, id: &str) -> Result<()>;
+    /// Set the display order and which images are offered; the platform
+    /// receives the enabled ones, in this order, with the next heartbeat.
+    async fn set_image_settings(&self, settings: ImageSettings) -> Result<()>;
 }
 
 /// Bundle of services handed to the protocol layer.

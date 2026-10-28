@@ -9,6 +9,10 @@
 //! `rootfs-<id>-<arch>.tar.zst` with SHA-256 and size. They are built by
 //! `images/build.sh` in this repository. Custom images are built on the node
 //! (see `Runtime::build_image`) and stored the same way.
+//!
+//! `<data>/images/settings.json` holds the owner's display order and the
+//! images not offered for new instances; both apply to what is reported to
+//! the platform.
 
 use std::path::{Path, PathBuf};
 
@@ -18,6 +22,7 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use super::fsutil::{mkdir_private, replace_symlink};
+use crate::model::ImageSettings;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Image {
@@ -103,7 +108,8 @@ impl ImageStore {
         &self.dir
     }
 
-    /// Every image with a current version, official and custom.
+    /// Every image with a current version, official and custom, in the
+    /// owner's order, disabled ones included.
     pub fn ready(&self) -> Vec<Image> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
@@ -113,9 +119,53 @@ impl ImageStore {
             .filter(|id| valid_id(id))
             .filter_map(|id| self.get(&id).ok())
             .collect();
-        // Official images first, then custom ones by name.
-        out.sort_by(|a, b| (a.custom, &a.name).cmp(&(b.custom, &b.name)));
+        let order = self.settings().order;
+        let rank = |id: &str| order.iter().position(|o| o == id).unwrap_or(usize::MAX);
+        // Unlisted images: official first, then custom ones by name.
+        out.sort_by(|a, b| (rank(&a.id), a.custom, &a.name).cmp(&(rank(&b.id), b.custom, &b.name)));
         out
+    }
+
+    /// Images offered for new instances (and to the platform), in order.
+    pub fn enabled(&self) -> Vec<Image> {
+        let disabled = self.settings().disabled;
+        self.ready()
+            .into_iter()
+            .filter(|i| !disabled.contains(&i.id))
+            .collect()
+    }
+
+    pub fn is_enabled(&self, id: &str) -> bool {
+        !self.settings().disabled.iter().any(|d| d == id)
+    }
+
+    fn settings_path(&self) -> PathBuf {
+        self.dir.join("settings.json")
+    }
+
+    pub fn settings(&self) -> ImageSettings {
+        std::fs::read(self.settings_path())
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Replace the order and disabled set. At least one available image must
+    /// stay enabled: an empty list in a heartbeat means "unchanged" to the
+    /// platform, so it would keep offering the old ones.
+    pub fn set_settings(&self, mut s: ImageSettings) -> Result<()> {
+        if let Some(bad) = s.order.iter().chain(&s.disabled).find(|id| !valid_id(id)) {
+            bail!("invalid image id {bad:?}");
+        }
+        let mut seen = std::collections::HashSet::new();
+        s.order.retain(|id| seen.insert(id.clone()));
+        s.disabled.sort();
+        s.disabled.dedup();
+        let ready = self.ready();
+        if !ready.is_empty() && ready.iter().all(|i| s.disabled.contains(&i.id)) {
+            bail!("at least one image must stay enabled");
+        }
+        crate::config::write_atomic(&self.settings_path(), &serde_json::to_vec_pretty(&s)?)
     }
 
     pub fn get(&self, id: &str) -> Result<Image> {
@@ -241,6 +291,13 @@ impl ImageStore {
             bail!("{id} is an official image");
         }
         std::fs::remove_file(self.dir.join(id).join("current"))?;
+        // A later image with the same id starts out enabled, at the end.
+        let mut s = self.settings();
+        if s.order.iter().chain(&s.disabled).any(|x| x == id) {
+            s.order.retain(|x| x != id);
+            s.disabled.retain(|x| x != id);
+            crate::config::write_atomic(&self.settings_path(), &serde_json::to_vec_pretty(&s)?)?;
+        }
         Ok(())
     }
 
@@ -350,6 +407,88 @@ mod tests {
         assert!(
             !gone.exists() && !store.dir.join("custom-x").exists(),
             "removed custom image without current"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_order_and_disable() {
+        let root = std::env::temp_dir().join(format!("runman-img-set-{}", uuid::Uuid::new_v4()));
+        let store = ImageStore::new(&root, "http://example.invalid").unwrap();
+        for (id, name, custom) in [
+            ("debian", "Debian", false),
+            ("alpine", "Alpine", false),
+            ("web", "Web", true),
+        ] {
+            let d = store.dir.join(id).join("1");
+            std::fs::create_dir_all(d.join("rootfs")).unwrap();
+            let meta = Image {
+                id: id.into(),
+                name: name.into(),
+                serial: "1".into(),
+                stop_signal: String::new(),
+                custom,
+                base: String::new(),
+                script: String::new(),
+                rootfs: PathBuf::new(),
+            };
+            std::fs::write(d.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            replace_symlink("1", &store.dir.join(id).join("current")).unwrap();
+        }
+        let ids = |v: Vec<Image>| v.into_iter().map(|i| i.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(store.ready()),
+            ["alpine", "debian", "web"],
+            "default order"
+        );
+
+        store
+            .set_settings(ImageSettings {
+                order: vec!["web".into(), "debian".into(), "web".into()],
+                disabled: vec!["debian".into()],
+            })
+            .unwrap();
+        assert_eq!(
+            ids(store.ready()),
+            ["web", "debian", "alpine"],
+            "listed first, rest after"
+        );
+        assert_eq!(ids(store.enabled()), ["web", "alpine"]);
+        assert!(!store.is_enabled("debian") && store.is_enabled("alpine"));
+        assert_eq!(
+            store.settings().order,
+            ["web", "debian"],
+            "duplicates dropped"
+        );
+
+        let all_off = ImageSettings {
+            order: vec![],
+            disabled: vec!["debian".into(), "alpine".into(), "web".into()],
+        };
+        assert!(
+            store.set_settings(all_off).is_err(),
+            "last enabled image stays"
+        );
+        assert!(
+            store
+                .set_settings(ImageSettings {
+                    order: vec!["../x".into()],
+                    disabled: vec![]
+                })
+                .is_err()
+        );
+
+        store
+            .set_settings(ImageSettings {
+                order: vec!["web".into()],
+                disabled: vec!["web".into()],
+            })
+            .unwrap();
+        store.remove_custom("web").unwrap();
+        assert_eq!(
+            store.settings(),
+            ImageSettings::default(),
+            "removed image forgotten"
         );
         let _ = std::fs::remove_dir_all(root);
     }

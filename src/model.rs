@@ -264,6 +264,20 @@ pub struct ImageInfo {
     pub script: String,
     /// Instances currently built on any version of this image.
     pub in_use: usize,
+    /// Offered for new instances and reported to the platform.
+    pub enabled: bool,
+}
+
+/// Owner's choices about which images are offered, and in what order.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ImageSettings {
+    /// Ids in display order; images not listed follow (official first, then
+    /// custom by name).
+    #[serde(default)]
+    pub order: Vec<String>,
+    /// Ids not offered for new instances.
+    #[serde(default)]
+    pub disabled: Vec<String>,
 }
 
 /// Request to build a custom image on the node.

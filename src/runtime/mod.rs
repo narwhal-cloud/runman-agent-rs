@@ -912,6 +912,11 @@ impl Runtime {
     /// `create` with the instance lock held.
     async fn create_locked(&self, spec: &InstanceSpec, builder: bool) -> Result<()> {
         let id = spec.vm_id.as_str();
+        // Checked before an existing instance is replaced. Builds may start
+        // from any image.
+        if !builder && !self.images.is_enabled(&spec.os_image) {
+            bail!("image {:?} is disabled on this node", spec.os_image);
+        }
         // Replacing an instance (reinstall, or a repeated create) keeps its
         // creation time and traffic counters: a reinstall must not hand out
         // a fresh monthly quota.
@@ -1077,7 +1082,7 @@ impl Instances for Runtime {
     async fn images(&self) -> Result<Vec<proto::OsImageInfo>> {
         Ok(self
             .images
-            .ready()
+            .enabled()
             .into_iter()
             .map(|i| proto::OsImageInfo {
                 id: i.id,

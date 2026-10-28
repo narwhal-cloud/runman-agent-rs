@@ -37,7 +37,8 @@ use crate::backend::{ImageAdmin, ensure_ssh_forward};
 use crate::config;
 use crate::local_wg::{LocalWg, parse_wg_quick};
 use crate::model::{
-    BuildRequest, ConsoleSize, InstanceSpec, L4Proto, PortForward, VmId, validate_password,
+    BuildRequest, ConsoleSize, ImageSettings, InstanceSpec, L4Proto, PortForward, VmId,
+    validate_password,
 };
 use crate::platform::Agent;
 use crate::updater::{Outcome, Updater};
@@ -136,6 +137,10 @@ impl Web {
             .route("/api/monitor/{id}", get(monitor_series))
             .route("/api/images", get(list_images))
             .route("/api/images/{id}", axum::routing::delete(delete_image))
+            .route(
+                "/api/images/settings",
+                axum::routing::put(put_image_settings),
+            )
             .route("/api/images/builds", get(list_builds).post(start_build))
             .route("/api/images/builds/{id}/log", get(build_log))
             .route("/api/wg/{resource}", axum::routing::delete(delete_wg))
@@ -860,6 +865,18 @@ async fn delete_image(
 ) -> ApiResult<Json<Value>> {
     image_admin(&web)?.delete_image(&id).await?;
     info!("panel: custom image {id} removed");
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn put_image_settings(
+    State(web): State<Arc<Web>>,
+    Json(req): Json<ImageSettings>,
+) -> ApiResult<Json<Value>> {
+    image_admin(&web)?.set_image_settings(req.clone()).await?;
+    info!(
+        "panel: image order {:?}, disabled {:?}",
+        req.order, req.disabled
+    );
     Ok(Json(json!({ "ok": true })))
 }
 

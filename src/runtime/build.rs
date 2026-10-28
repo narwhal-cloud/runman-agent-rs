@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use super::Runtime;
 use super::image::{Image, valid_id};
 use crate::backend::{ImageAdmin, Instances};
-use crate::model::{BuildInfo, BuildRequest, ImageInfo, InstanceSpec, VmId};
+use crate::model::{BuildInfo, BuildRequest, ImageInfo, ImageSettings, InstanceSpec, VmId};
 
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(3600);
 const MAX_SCRIPT: usize = 64 * 1024;
@@ -285,6 +285,7 @@ pub struct ImageAdminHandle(pub Arc<Runtime>);
 impl ImageAdmin for ImageAdminHandle {
     async fn list_images(&self) -> Result<Vec<ImageInfo>> {
         let records = self.0.records()?;
+        let disabled = self.0.images.settings().disabled;
         Ok(self
             .0
             .images
@@ -296,6 +297,7 @@ impl ImageAdmin for ImageAdminHandle {
                     .iter()
                     .filter(|r| !r.builder && r.lower.starts_with(&id_dir))
                     .count();
+                let enabled = !disabled.contains(&img.id);
                 ImageInfo {
                     id: img.id,
                     name: img.name,
@@ -304,6 +306,7 @@ impl ImageAdmin for ImageAdminHandle {
                     base: img.base,
                     script: img.script,
                     in_use,
+                    enabled,
                 }
             })
             .collect())
@@ -366,5 +369,9 @@ impl ImageAdmin for ImageAdminHandle {
         self.0.images.remove_custom(id)?;
         self.0.gc_images();
         Ok(())
+    }
+
+    async fn set_image_settings(&self, settings: ImageSettings) -> Result<()> {
+        self.0.images.set_settings(settings)
     }
 }

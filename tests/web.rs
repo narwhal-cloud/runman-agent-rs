@@ -659,6 +659,14 @@ async fn image_management_needs_a_capable_backend() {
     )
     .await;
     assert_eq!(r.status(), 501);
+    let r = c
+        .put(format!("{}/api/images/settings", p.base))
+        .header("X-Runman", "1")
+        .json(&json!({"order": ["debian"], "disabled": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 501);
 }
 
 #[tokio::test]

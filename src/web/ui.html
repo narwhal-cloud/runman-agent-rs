@@ -56,6 +56,7 @@ button.btn, .btn { font: inherit; border: 1px solid var(--line); background: var
   padding: 4px 10px; border-radius: 6px; cursor: pointer; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn.danger { color: var(--bad); }
+.btn:disabled { opacity: .4; cursor: default; }
 .btn:disabled { opacity: .5; cursor: default; }
 .actions { display: flex; flex-wrap: wrap; gap: 4px; }
 input, select { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); }
@@ -514,12 +515,16 @@ async function loadImages() {
     const [images, builds] = await Promise.all([api('/api/images'), api('/api/images/builds')]);
     const draft = imageFormDraft || {};
     el.innerHTML = `
+      <p class="muted">已启用的镜像按此顺序上报平台并供新实例选择；停用后不能再用它新建或重装实例，已有实例不受影响。</p>
       <div class="table-wrap"><table>
-        <tr><th>镜像</th><th>ID</th><th>版本</th><th>来源</th><th>使用中</th><th></th></tr>
-        ${images.map(i => `<tr data-id="${esc(i.id)}">
+        <tr><th>顺序</th><th>镜像</th><th>ID</th><th>版本</th><th>来源</th><th>使用中</th><th>状态</th><th></th></tr>
+        ${images.map((i, n) => `<tr data-id="${esc(i.id)}">
+          <td><div class="actions"><button class="btn" data-act="up"${n ? '' : ' disabled'}>↑</button><button class="btn" data-act="down"${n < images.length - 1 ? '' : ' disabled'}>↓</button></div></td>
           <td>${esc(i.name)}</td><td class="mono">${esc(i.id)}</td><td class="mono">${esc(i.serial)}</td>
           <td>${i.custom ? `自定义（基于 <code>${esc(i.base)}</code>）` : '官方'}</td><td>${i.in_use} 个实例</td>
+          <td>${i.enabled ? '<span class="badge ok">启用</span>' : '<span class="badge muted">停用</span>'}</td>
           <td><div class="actions">
+            <button class="btn" data-act="toggle">${i.enabled ? '停用' : '启用'}</button>
             ${i.custom ? '<button class="btn" data-act="edit">编辑重建</button><button class="btn danger" data-act="delete">删除</button>' : ''}
             <button class="btn" data-act="base">以此为基础</button></div></td></tr>`).join('')}
       </table></div>
@@ -599,6 +604,14 @@ $('#tab-images').addEventListener('click', async e => {
     }
     const images = await api('/api/images');
     const img = images.find(i => i.id === id);
+    if (['up', 'down', 'toggle'].includes(b.dataset.act)) {
+      const order = images.map(i => i.id), n = order.indexOf(id), m = n + (b.dataset.act === 'up' ? -1 : 1);
+      if (b.dataset.act !== 'toggle' && order[m]) [order[n], order[m]] = [order[m], order[n]];
+      const disabled = images.filter(i => i.id === id && b.dataset.act === 'toggle' ? i.enabled : !i.enabled).map(i => i.id);
+      await api('/api/images/settings', { method: 'PUT', body: { order, disabled } });
+      if (b.dataset.act === 'toggle') toast(img.enabled ? '已停用' : '已启用');
+      return loadImages();
+    }
     imageFormDraft = b.dataset.act === 'edit'
       ? { image_id: img.id, name: img.name, base: img.base, script: img.script }
       : { image_id: '', name: '', base: img.id, script: '' };
