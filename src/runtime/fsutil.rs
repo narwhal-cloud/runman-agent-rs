@@ -144,6 +144,31 @@ impl RootFs {
         Ok(())
     }
 
+    /// Names in directory `rel`; empty when it does not exist.
+    pub fn list(&self, rel: &str) -> Result<Vec<std::ffi::OsString>> {
+        let dir = match self.dir(Path::new(rel)) {
+            Ok(fd) => fd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("open {rel}")),
+        };
+        list_fd(&dir).with_context(|| format!("list {rel}"))
+    }
+
+    /// Remove `rel` and, if it is a directory, everything below it. Nothing
+    /// below is followed: a symlink is removed itself.
+    pub fn remove_all(&self, rel: &str) -> Result<()> {
+        let (parent, name) = split(rel)?;
+        let Ok(dir) = self.dir(parent) else {
+            return Ok(());
+        };
+        match remove_at(&dir, name) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("remove {rel}"))
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn remove(&self, rel: &str) -> Result<()> {
         let (parent, name) = split(rel)?;
         let Ok(dir) = self.dir(parent) else {
@@ -158,6 +183,49 @@ impl RootFs {
         }
         Ok(())
     }
+}
+
+fn list_fd(dir: &OwnedFd) -> io::Result<Vec<std::ffi::OsString>> {
+    std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect()
+}
+
+/// Remove `name` in `dir` without following symlinks at any depth.
+fn remove_at(dir: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<()> {
+    let c = cstr(name.as_bytes()).map_err(io::Error::other)?;
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstatat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let fd = libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_RDONLY | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let sub = OwnedFd::from_raw_fd(fd);
+            for entry in list_fd(&sub)? {
+                remove_at(&sub, &entry)?;
+            }
+            if libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        } else if libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn split(rel: &str) -> Result<(&Path, &std::ffi::OsStr)> {

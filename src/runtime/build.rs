@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use tracing::{info, warn};
 
 use super::Runtime;
+use super::fsutil::RootFs;
 use super::image::{Image, valid_id};
 use crate::backend::{ImageAdmin, Instances};
 use crate::model::{BuildInfo, BuildRequest, ImageInfo, ImageSettings, InstanceSpec, VmId};
@@ -257,24 +258,30 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     if !status.success() {
         bail!("cp failed ({status})");
     }
+    scrub(&RootFs::open(dst)?)
+}
+
+/// Drop per-instance identity and history from a copied tree. The tree came
+/// out of the build instance, so every path is resolved inside it: a planted
+/// `etc/ssh -> /etc/ssh` must not touch the host.
+fn scrub(root: &RootFs) -> Result<()> {
     for rel in [
         "root/.bash_history",
         "root/.ash_history",
         "var/lib/dbus/machine-id",
     ] {
-        let _ = std::fs::remove_file(dst.join(rel));
+        let _ = root.remove(rel);
     }
-    if let Ok(keys) = std::fs::read_dir(dst.join("etc/ssh")) {
-        for k in keys.flatten() {
-            if k.file_name().to_string_lossy().starts_with("ssh_host_") {
-                let _ = std::fs::remove_file(k.path());
-            }
+    for name in root.list("etc/ssh").unwrap_or_default() {
+        let name = name.to_string_lossy();
+        if name.starts_with("ssh_host_") {
+            let _ = root.remove(&format!("etc/ssh/{name}"));
         }
     }
-    if dst.join("etc/machine-id").exists() {
-        std::fs::write(dst.join("etc/machine-id"), b"")?;
+    if root.exists("etc/machine-id") {
+        root.write("etc/machine-id", b"", 0o444)?;
     }
-    let _ = std::fs::remove_dir_all(dst.join("var/log/journal"));
+    let _ = root.remove_all("var/log/journal");
     Ok(())
 }
 
@@ -373,5 +380,68 @@ impl ImageAdmin for ImageAdminHandle {
 
     async fn set_image_settings(&self, settings: ImageSettings) -> Result<()> {
         self.0.images.set_settings(settings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn scrub_stays_inside_the_tree() {
+        let base = std::env::temp_dir().join(format!("runman-scrub-{}", uuid::Uuid::new_v4()));
+        let host = base.join("host");
+        let tree = base.join("tree");
+        for d in ["etc/ssh", "root", "var/log/journal/x"] {
+            std::fs::create_dir_all(host.join(d)).unwrap();
+        }
+        let host_files = [
+            "etc/machine-id",
+            "etc/ssh/ssh_host_ed25519_key",
+            "root/.bash_history",
+            "var/log/journal/x/system.journal",
+        ];
+        for f in host_files {
+            std::fs::write(host.join(f), b"host").unwrap();
+        }
+        // Every path the scrub touches points at the "host" tree.
+        std::fs::create_dir_all(tree.join("etc")).unwrap();
+        std::fs::create_dir_all(tree.join("var/log")).unwrap();
+        symlink(host.join("etc/machine-id"), tree.join("etc/machine-id")).unwrap();
+        symlink(host.join("etc/ssh"), tree.join("etc/ssh")).unwrap();
+        symlink(host.join("root"), tree.join("root")).unwrap();
+        symlink(host.join("var/log/journal"), tree.join("var/log/journal")).unwrap();
+
+        scrub(&RootFs::open(&tree).unwrap()).unwrap();
+        for f in host_files {
+            assert_eq!(
+                std::fs::read(host.join(f)).unwrap(),
+                b"host",
+                "{f} untouched"
+            );
+        }
+        // Resolved inside the tree the link dangles, so it is left alone.
+        assert!(
+            std::fs::symlink_metadata(tree.join("etc/machine-id"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(std::fs::symlink_metadata(tree.join("var/log/journal")).is_err());
+
+        // The ordinary case still cleans up.
+        let plain = base.join("plain");
+        std::fs::create_dir_all(plain.join("etc/ssh")).unwrap();
+        std::fs::create_dir_all(plain.join("var/log/journal/x")).unwrap();
+        std::fs::write(plain.join("etc/ssh/ssh_host_rsa_key"), b"k").unwrap();
+        std::fs::write(plain.join("etc/ssh/sshd_config"), b"c").unwrap();
+        std::fs::write(plain.join("etc/machine-id"), b"abc").unwrap();
+        std::fs::write(plain.join("var/log/journal/x/j"), b"j").unwrap();
+        scrub(&RootFs::open(&plain).unwrap()).unwrap();
+        assert!(!plain.join("etc/ssh/ssh_host_rsa_key").exists());
+        assert!(plain.join("etc/ssh/sshd_config").exists());
+        assert_eq!(std::fs::read(plain.join("etc/machine-id")).unwrap(), b"");
+        assert!(!plain.join("var/log/journal").exists());
+        let _ = std::fs::remove_dir_all(base);
     }
 }
