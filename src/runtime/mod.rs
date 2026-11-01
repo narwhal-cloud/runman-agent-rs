@@ -606,6 +606,7 @@ impl Runtime {
             ])
             .args(["-p", "TimeoutStopSec=60", "-p", "OOMPolicy=continue"])
             .args(["-p", &format!("MemoryMax={}M", rec.ram_mb)])
+            .args(["-p", &format!("MemoryHigh={}M", memory_high_mb(rec.ram_mb))])
             .args(["-p", &format!("MemorySwapMax={}M", rec.ram_mb)])
             .args(["-p", &format!("CPUQuota={}%", rec.cpu * 100)])
             .args(["-p", &format!("TasksMax={}", 1024 * rec.cpu.max(4))])
@@ -902,6 +903,14 @@ fn memory_used(cg: &Path) -> Option<u64> {
         .ok()?;
     let inactive = read_kv(&cg.join("memory.stat"), "inactive_file").unwrap_or(0);
     Some(current.saturating_sub(inactive))
+}
+
+/// Above this the kernel throttles and reclaims instead of OOM-killing at
+/// `MemoryMax`. Without the margin, a large write fills the instance's memory
+/// with dirty pages faster than the disk takes them, and the OOM killer picks
+/// the instance's init.
+fn memory_high_mb(ram_mb: u64) -> u64 {
+    ram_mb - (ram_mb / 8).clamp(16, 256).min(ram_mb / 2)
 }
 
 fn hostname_for(id: &str) -> String {
@@ -1274,5 +1283,18 @@ impl WgBindings for Runtime {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_high_leaves_a_margin() {
+        assert_eq!(memory_high_mb(128), 112);
+        assert_eq!(memory_high_mb(1024), 896);
+        assert_eq!(memory_high_mb(8192), 7936);
+        assert_eq!(memory_high_mb(16), 8);
     }
 }

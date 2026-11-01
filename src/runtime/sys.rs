@@ -4,7 +4,7 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // Syscall numbers shared by x86_64 and aarch64 (the post-4.20 unified table).
 const SYS_OPEN_TREE: libc::c_long = 428;
@@ -16,6 +16,8 @@ const OPEN_TREE_CLONE: libc::c_uint = 1;
 const AT_RECURSIVE: libc::c_uint = 0x8000;
 const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
 const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
+
+const LOOP_SET_DIRECT_IO: libc::c_ulong = 0x4C08;
 
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_IN_ROOT: u64 = 0x10;
@@ -161,6 +163,36 @@ fn unescape_mountinfo(s: &str) -> Vec<u8> {
 }
 
 /// Lazily detach `path` if it is mounted (ignores "not mounted").
+/// `/sys/block/loopN` of the loop device backed by `image`.
+pub fn loop_device(image: &Path) -> Option<PathBuf> {
+    std::fs::read_dir("/sys/block")
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|dir| {
+            std::fs::read_to_string(dir.join("loop/backing_file"))
+                .is_ok_and(|b| Path::new(b.trim()) == image)
+        })
+}
+
+/// Switch the loop device backed by `image` to direct I/O. Otherwise the
+/// image file's page cache duplicates the one of the filesystem inside it,
+/// both are charged to the instance's memory cgroup, and a large write can
+/// OOM-kill the instance.
+pub fn loop_direct_io(image: &Path) -> io::Result<()> {
+    let dir = loop_device(image)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no loop device"))?;
+    if std::fs::read_to_string(dir.join("loop/dio")).is_ok_and(|d| d.trim() == "1") {
+        return Ok(());
+    }
+    let name = dir.file_name().unwrap_or_default();
+    let dev = std::fs::File::open(Path::new("/dev").join(name))?;
+    check(
+        unsafe { libc::ioctl(dev.as_raw_fd(), LOOP_SET_DIRECT_IO as _, 1 as libc::c_ulong) }.into(),
+    )?;
+    Ok(())
+}
+
 pub fn umount_if_mounted(path: &Path) -> io::Result<()> {
     while is_mountpoint(path) {
         nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH).map_err(io::Error::from)?;

@@ -36,6 +36,14 @@ use super::spec::{ID_RANGE, RunSpec, parse_signal};
 use super::sys;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(45);
+/// Init dying on its own (OOM kill, crash) restarts the instance after a
+/// delay that doubles with each quick failure; it stays down once this many
+/// restarts in a row failed.
+const CRASH_RESTARTS: u32 = 5;
+const CRASH_DELAY: Duration = Duration::from_secs(1);
+const CRASH_DELAY_MAX: Duration = Duration::from_secs(30);
+/// A boot that lasted this long resets the count.
+const CRASH_STABLE: Duration = Duration::from_secs(60);
 const CONSOLE_LOG_MAX: u64 = 1 << 20;
 const TTY_GID: u32 = 5;
 
@@ -74,7 +82,9 @@ fn run(spec_path: &Path) -> Result<()> {
     mount_disk(&spec)?;
 
     let mut stop_requested = false;
+    let mut crashes = 0;
     loop {
+        let booted = Instant::now();
         let outcome = boot_once(&spec, &cg, &sfd, stop_signal, &mut stop_requested);
         let _ = fs::remove_file(spec.init_pid_file());
         cg.destroy_ct()?;
@@ -89,7 +99,23 @@ fn run(spec_path: &Path) -> Result<()> {
                 eprintln!("supervisor: instance rebooted, starting again");
                 continue;
             }
-            Outcome::Other(why) if !stop_requested => eprintln!("supervisor: init ended: {why}"),
+            Outcome::Other(why) if !stop_requested => {
+                if booted.elapsed() >= CRASH_STABLE {
+                    crashes = 0;
+                }
+                crashes += 1;
+                match crash_delay(crashes) {
+                    Some(delay) => {
+                        eprintln!("supervisor: init ended: {why}; restarting in {delay:?}");
+                        if sleep_unless_stopped(&sfd, delay)? {
+                            continue;
+                        }
+                    }
+                    None => eprintln!(
+                        "supervisor: init ended: {why}; {CRASH_RESTARTS} restarts in a row failed, leaving the instance stopped"
+                    ),
+                }
+            }
             _ => {}
         }
         break;
@@ -98,18 +124,50 @@ fn run(spec_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn mount_disk(spec: &RunSpec) -> Result<()> {
-    let target = spec.mnt_disk();
-    if sys::is_mountpoint(&target) {
-        return Ok(());
+/// Delay before restart number `n` (from 1) after init died on its own.
+fn crash_delay(n: u32) -> Option<Duration> {
+    (n <= CRASH_RESTARTS).then(|| (CRASH_DELAY * 2u32.pow(n - 1)).min(CRASH_DELAY_MAX))
+}
+
+/// Sleep for `delay`; false if a stop was requested meanwhile.
+fn sleep_unless_stopped(sfd: &SignalFd, delay: Duration) -> Result<bool> {
+    let deadline = Instant::now() + delay;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(true);
+        }
+        let mut fd = libc::pollfd {
+            fd: sfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut fd, 1, left.as_millis().min(i32::MAX as u128) as i32) };
+        while let Some(info) = sfd.read_signal()? {
+            if matches!(info.ssi_signo as i32, libc::SIGTERM | libc::SIGINT) {
+                return Ok(false);
+            }
+        }
     }
-    let status = Command::new("mount")
-        .args(["-t", "ext4", "-o", "loop,noatime,nodev"])
-        .arg(spec.disk_image())
-        .arg(&target)
-        .status()?;
-    if !status.success() {
-        bail!("mount {} failed", spec.disk_image().display());
+}
+
+fn mount_disk(spec: &RunSpec) -> Result<()> {
+    let image = spec.disk_image();
+    let target = spec.mnt_disk();
+    if !sys::is_mountpoint(&target) {
+        let status = Command::new("mount")
+            .args(["-t", "ext4", "-o", "loop,noatime,nodev"])
+            .arg(&image)
+            .arg(&target)
+            .status()?;
+        if !status.success() {
+            bail!("mount {} failed", image.display());
+        }
+    }
+    // Not fatal: backing filesystems without O_DIRECT still work, only with
+    // the image cached twice.
+    if let Err(e) = sys::loop_direct_io(&image) {
+        eprintln!("supervisor: direct I/O for {}: {e}", image.display());
     }
     Ok(())
 }
@@ -710,5 +768,24 @@ impl ConsoleLog {
             }
         }
         let _ = self.file.write_all(data);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_restarts_back_off_then_give_up() {
+        let delays: Vec<_> = (1..=CRASH_RESTARTS + 1).map(crash_delay).collect();
+        assert_eq!(
+            delays,
+            [1, 2, 4, 8, 16]
+                .map(|s| Some(Duration::from_secs(s)))
+                .into_iter()
+                .chain([None])
+                .collect::<Vec<_>>()
+        );
+        assert!(crash_delay(CRASH_RESTARTS).unwrap() <= CRASH_DELAY_MAX);
     }
 }

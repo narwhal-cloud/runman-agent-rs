@@ -67,17 +67,13 @@ fn parse_io_stat(text: &str, own_loop: Option<&str>) -> Io {
 
 /// `major:minor` of the loop device backed by `image`.
 fn loop_device(image: &Path) -> Option<String> {
-    std::fs::read_dir("/sys/block")
-        .ok()?
-        .flatten()
-        .find_map(|e| {
-            let dir = e.path();
-            let backing = std::fs::read_to_string(dir.join("loop/backing_file")).ok()?;
-            (Path::new(backing.trim()) == image)
-                .then(|| std::fs::read_to_string(dir.join("dev")).ok())
-                .flatten()
-                .map(|d| d.trim().to_owned())
-        })
+    let dir = super::sys::loop_device(image)?;
+    Some(
+        std::fs::read_to_string(dir.join("dev"))
+            .ok()?
+            .trim()
+            .to_owned(),
+    )
 }
 
 fn read_u64(path: PathBuf) -> Option<u64> {
