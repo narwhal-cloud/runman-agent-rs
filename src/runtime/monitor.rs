@@ -1,5 +1,9 @@
 //! Once-a-minute resource samples of running instances (see `history`).
 
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -88,6 +92,115 @@ fn disk_used(init_pid: i32) -> Option<u64> {
     Some((st.blocks() as u64).saturating_sub(st.blocks_free() as u64) * block)
 }
 
+/// Connections of one instance at one moment.
+#[derive(Debug, Default, PartialEq)]
+struct Conns {
+    tcp: u64,
+    udp: u64,
+    remotes: HashSet<IpAddr>,
+}
+
+/// An instance to count connections of.
+struct ConnTarget {
+    id: String,
+    init_pid: i32,
+    /// Its own addresses, as they appear on the host.
+    addrs: Vec<IpAddr>,
+}
+
+/// Address of `/proc/net/tcp*`: 32-bit words in host byte order.
+fn parse_proc_addr(hex: &str) -> Option<IpAddr> {
+    let word = |i: usize| {
+        u32::from_str_radix(hex.get(i * 8..(i + 1) * 8)?, 16)
+            .ok()
+            .map(u32::to_ne_bytes)
+    };
+    match hex.len() {
+        8 => Some(IpAddr::from(word(0)?)),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for (i, chunk) in bytes.chunks_mut(4).enumerate() {
+                chunk.copy_from_slice(&word(i)?);
+            }
+            // Dual-stack sockets show IPv4 peers as ::ffff:a.b.c.d.
+            Some(IpAddr::from(bytes).to_canonical())
+        }
+        _ => None,
+    }
+}
+
+/// Add the established connections of a `/proc/<pid>/net/tcp*` table. The
+/// instance's own sockets, not conntrack: conntrack keeps entries of vanished
+/// peers and of the instance's previous boot for days.
+fn count_tcp(table: impl BufRead, conns: &mut Conns) {
+    for line in table.lines().map_while(Result::ok).skip(1) {
+        let mut fields = line.split_whitespace();
+        let (Some(remote), Some("01")) = (fields.nth(2), fields.next()) else {
+            continue;
+        };
+        let Some(ip) = remote.split(':').next().and_then(parse_proc_addr) else {
+            continue;
+        };
+        if !ip.is_loopback() {
+            conns.tcp += 1;
+            conns.remotes.insert(ip);
+        }
+    }
+}
+
+/// Add UDP flows from `/proc/net/nf_conntrack` to the instance owning either
+/// end: `owners` maps its addresses to its index in `conns`. UDP sockets have
+/// no peers to read, and these entries expire within minutes.
+fn count_udp(table: impl BufRead, owners: &HashMap<IpAddr, usize>, conns: &mut [Conns]) {
+    for line in table.lines().map_while(Result::ok) {
+        let mut fields = line.split_whitespace();
+        if fields.nth(2) != Some("udp") {
+            continue;
+        }
+        let mut addrs = fields
+            .filter_map(|f| f.strip_prefix("src=").or_else(|| f.strip_prefix("dst=")))
+            .filter_map(|a| a.parse::<IpAddr>().ok());
+        // Original direction, then the source of the reply: the instance
+        // for flows forwarded to it.
+        let (Some(src), Some(dst), Some(reply)) = (addrs.next(), addrs.next(), addrs.next()) else {
+            continue;
+        };
+        let (from, to) = (owners.get(&src), owners.get(&reply));
+        if let Some(&i) = from {
+            conns[i].udp += 1;
+            conns[i].remotes.insert(dst);
+        }
+        if let Some(&i) = to.filter(|_| to != from) {
+            conns[i].udp += 1;
+            conns[i].remotes.insert(src);
+        }
+    }
+}
+
+/// Connections per target, and whether UDP flows could be read.
+fn measure_conns(targets: &[ConnTarget]) -> (Vec<Conns>, bool) {
+    let mut conns: Vec<Conns> = targets.iter().map(|_| Conns::default()).collect();
+    for (target, c) in targets.iter().zip(&mut conns) {
+        for table in ["tcp", "tcp6"] {
+            let path = format!("/proc/{}/net/{table}", target.init_pid);
+            if let Ok(f) = File::open(path) {
+                count_tcp(BufReader::new(f), c);
+            }
+        }
+    }
+    let owners = targets
+        .iter()
+        .enumerate()
+        .flat_map(|(i, t)| t.addrs.iter().map(move |a| (*a, i)))
+        .collect();
+    let conntrack = File::open("/proc/net/nf_conntrack");
+    let udp_known = conntrack.is_ok();
+    if let Ok(f) = conntrack {
+        count_udp(BufReader::new(f), &owners, &mut conns);
+    }
+    (conns, udp_known)
+}
+
 /// Rate between two counter readings; 0 across a counter reset.
 fn rate(cur: u64, prev: u64, secs: f64) -> f64 {
     cur.checked_sub(prev).map_or(0.0, |d| d as f64 / secs)
@@ -100,6 +213,7 @@ impl Runtime {
         let ts = unix_now();
         let mut out = Vec::new();
         let mut live = Vec::new();
+        let mut targets = Vec::new();
         for rec in records.iter().filter(|r| !r.builder) {
             let Some(pid) = std::fs::read_to_string(self.run_spec(rec).init_pid_file())
                 .ok()
@@ -145,6 +259,14 @@ impl Runtime {
             let same_veth = prev.ifindex == now.ifindex;
             let net = |cur: u64, old: u64| if same_veth { rate(cur, old, secs) } else { 0.0 };
             let cpu = rate(now.cpu_usec, prev.cpu_usec, secs) / 1e6 / f64::from(rec.cpu.max(1));
+            let mut addrs = self.dedicated_for(&rec.id);
+            addrs.push(rec.addrs.ipv4.into());
+            addrs.extend(rec.addrs.ipv6.map(IpAddr::from));
+            targets.push(ConnTarget {
+                id: rec.id.clone(),
+                init_pid: pid,
+                addrs,
+            });
             out.push((
                 rec.id.clone(),
                 Sample {
@@ -168,6 +290,7 @@ impl Runtime {
                     tx: net(now.tx_bytes, prev.tx_bytes) * 8.0,
                     rxp: net(now.rx_packets, prev.rx_packets),
                     txp: net(now.tx_packets, prev.tx_packets),
+                    ..Default::default()
                 },
             ));
         }
@@ -177,6 +300,14 @@ impl Runtime {
             .retain(|id, _| live.contains(id));
         let history = self.history.clone();
         let result = tokio::task::spawn_blocking(move || {
+            let (conns, udp_known) = measure_conns(&targets);
+            for (target, c) in targets.iter().zip(&conns) {
+                if let Some((_, s)) = out.iter_mut().find(|(id, _)| *id == target.id) {
+                    s.tcp = Some(c.tcp as f64);
+                    s.udp = udp_known.then_some(c.udp as f64);
+                    s.ips = Some(c.remotes.len() as f64);
+                }
+            }
             history.record(&out)?;
             history.maintain(ts)
         })
@@ -228,5 +359,62 @@ mod tests {
         );
         assert_eq!(rate(10, 4, 2.0), 3.0);
         assert_eq!(rate(4, 10, 2.0), 0.0);
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn tcp_counts_established_remote_peers() {
+        let v4 = "  sl  local_address rem_address   st tx_queue rx_queue
+                  0: 00000000:0016 00000000:0000 0A 00000000:00000000
+                  1: 02005B0A:0016 0A02A8C0:C350 01 00000000:00000000
+                  2: 0100007F:1F90 0100007F:D4A6 01 00000000:00000000
+                  3: 02005B0A:0016 0A02A8C0:C351 01 00000000:00000000
+                  4: 02005B0A:0016 0B02A8C0:C351 06 00000000:00000000
+";
+        // An IPv4 peer on a dual-stack socket, an IPv6 peer, IPv6 loopback.
+        let v6 = "  sl  local_address remote_address st
+                  0: 00000000000000000000000000000000:0016 0000000000000000FFFF00000C02A8C0:C350 01
+                  1: 00000000000000000000000000000000:0016 B80D012000000000000000000100FFFF:C350 01
+                  2: 00000000000000000000000001000000:0016 00000000000000000000000001000000:C350 01
+";
+        let mut c = Conns::default();
+        count_tcp(v4.as_bytes(), &mut c);
+        count_tcp(v6.as_bytes(), &mut c);
+        assert_eq!(c.tcp, 4);
+        assert_eq!(
+            c.remotes,
+            HashSet::from([
+                ip("192.168.2.10"),
+                ip("192.168.2.12"),
+                ip("2001:db8::ffff:1"),
+            ])
+        );
+    }
+
+    #[test]
+    fn udp_flows_belong_to_the_instance_at_either_end() {
+        let table = "ipv4     2 udp      17 29 src=10.91.0.2 dst=1.1.1.1 sport=5000 dport=53 packets=1 bytes=60 src=1.1.1.1 dst=203.0.113.1 sport=53 dport=5000 packets=1 bytes=90 mark=0 use=2
+ipv4     2 udp      17 170 src=198.51.100.7 dst=203.0.113.1 sport=4000 dport=27015 src=10.91.0.3 dst=198.51.100.7 sport=27015 dport=4000 [ASSURED] mark=0 use=2
+ipv6     10 udp      17 25 src=2001:0db8:0000:0000:0000:0000:0000:0001 dst=2001:0db8:0001:0000:0000:0000:0000:0002 sport=1 dport=2 src=2001:0db8:0001:0000:0000:0000:0000:0002 dst=2001:0db8:0000:0000:0000:0000:0000:0001 sport=2 dport=1 mark=0 use=2
+ipv4     2 tcp      6 300 ESTABLISHED src=10.91.0.2 dst=1.1.1.1 sport=1 dport=2 src=1.1.1.1 dst=10.91.0.2 sport=2 dport=1 [ASSURED] mark=0 use=2
+ipv4     2 udp      17 29 src=192.168.2.1 dst=192.168.2.2 sport=1 dport=2 src=192.168.2.2 dst=192.168.2.1 sport=2 dport=1 mark=0 use=2
+";
+        let owners = HashMap::from([
+            (ip("10.91.0.2"), 0),
+            (ip("10.91.0.3"), 1),
+            (ip("2001:db8:1::2"), 1),
+        ]);
+        let mut conns = [Conns::default(), Conns::default()];
+        count_udp(table.as_bytes(), &owners, &mut conns);
+        assert_eq!(conns[0].udp, 1);
+        assert_eq!(conns[0].remotes, HashSet::from([ip("1.1.1.1")]));
+        assert_eq!(
+            conns[1].udp, 2,
+            "forwarded in, and over IPv6 to its address"
+        );
+        assert!(conns[1].remotes.contains(&ip("198.51.100.7")));
     }
 }

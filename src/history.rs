@@ -42,6 +42,13 @@ pub struct Sample {
     /// Network, packets per second.
     pub rxp: f64,
     pub txp: f64,
+    /// Established TCP connections; None where not measured, like every
+    /// sample of the connection columns taken before they existed.
+    pub tcp: Option<f64>,
+    /// UDP flows tracked by the host.
+    pub udp: Option<f64>,
+    /// Distinct remote addresses of those connections.
+    pub ips: Option<f64>,
 }
 
 /// A chart point: averages over its bucket, plus peaks.
@@ -53,6 +60,8 @@ pub struct Point {
     pub rx_max: f64,
     pub tx_max: f64,
     pub wr_max: f64,
+    /// Peak of TCP connections plus UDP flows.
+    pub conns_max: Option<f64>,
 }
 
 /// Averages of one instance over a window, for the ranking.
@@ -62,12 +71,25 @@ pub struct Usage {
     #[serde(flatten)]
     pub avg: Sample,
     pub cpu_max: f64,
+    pub conns_max: Option<f64>,
     /// Samples in the window.
     pub samples: u64,
 }
 
 pub struct History {
     db: Mutex<Connection>,
+}
+
+/// Columns newer than the tables' first version; NULL in existing rows.
+fn add_columns(db: &Connection, table: &str, columns: &[&str]) -> Result<()> {
+    let have = db
+        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for column in columns.iter().filter(|c| !have.iter().any(|h| h == *c)) {
+        db.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} REAL"), [])?;
+    }
+    Ok(())
 }
 
 impl History {
@@ -99,6 +121,8 @@ impl History {
                  PRIMARY KEY (vm, ts)) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS samples_ts ON samples (ts);",
         )?;
+        add_columns(&db, "samples", &["tcp", "udp", "ips"])?;
+        add_columns(&db, "rollups", &["tcp", "udp", "ips", "conns_max"])?;
         Ok(Self { db: Mutex::new(db) })
     }
 
@@ -107,8 +131,8 @@ impl History {
         let tx = db.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO samples (vm, ts, cpu, mem, disk, rd, wr, rio, wio, rx, tx, rxp, txp)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT OR REPLACE INTO samples (vm, ts, cpu, mem, disk, rd, wr, rio, wio, rx, tx, rxp, txp, tcp, udp, ips)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             )?;
             for (vm, s) in samples {
                 stmt.execute(params![
@@ -124,7 +148,10 @@ impl History {
                     s.rx,
                     s.tx,
                     s.rxp,
-                    s.txp
+                    s.txp,
+                    s.tcp,
+                    s.udp,
+                    s.ips
                 ])?;
             }
         }
@@ -142,10 +169,12 @@ impl History {
             |r| r.get(0),
         )?;
         db.execute(
-            "INSERT OR REPLACE INTO rollups
+            "INSERT OR REPLACE INTO rollups (vm, ts, cpu, mem, disk, rd, wr, rio, wio, rx, tx, rxp, txp,
+                                             cpu_max, rx_max, tx_max, wr_max, tcp, udp, ips, conns_max)
              SELECT vm, ts / ?1 * ?1 AS b,
                     AVG(cpu), CAST(AVG(mem) AS INTEGER), MAX(disk), AVG(rd), AVG(wr), AVG(rio), AVG(wio),
-                    AVG(rx), AVG(tx), AVG(rxp), AVG(txp), MAX(cpu), MAX(rx), MAX(tx), MAX(wr)
+                    AVG(rx), AVG(tx), AVG(rxp), AVG(txp), MAX(cpu), MAX(rx), MAX(tx), MAX(wr),
+                    AVG(tcp), AVG(udp), AVG(ips), MAX(tcp + COALESCE(udp, 0))
              FROM samples WHERE ts >= ?2 AND ts < ?3 GROUP BY vm, b",
             params![ROLLUP_SECS as i64, last, done],
         )?;
@@ -175,18 +204,22 @@ impl History {
         let from = now.saturating_sub(range) as i64;
         // Raw samples while they cover the range, rollups beyond.
         let (table, step, peaks) = if range <= RAW_KEEP {
-            ("samples", 60, "MAX(cpu), MAX(rx), MAX(tx), MAX(wr)")
+            (
+                "samples",
+                60,
+                "MAX(cpu), MAX(rx), MAX(tx), MAX(wr), MAX(tcp + COALESCE(udp, 0))",
+            )
         } else {
             (
                 "rollups",
                 ROLLUP_SECS,
-                "MAX(cpu_max), MAX(rx_max), MAX(tx_max), MAX(wr_max)",
+                "MAX(cpu_max), MAX(rx_max), MAX(tx_max), MAX(wr_max), MAX(conns_max)",
             )
         };
         let bucket = (range / MAX_POINTS).max(step) as i64;
         let sql = format!(
             "SELECT ts / ?1 * ?1 AS b, AVG(cpu), AVG(mem), MAX(disk), AVG(rd), AVG(wr), AVG(rio), AVG(wio),
-                    AVG(rx), AVG(tx), AVG(rxp), AVG(txp), {peaks}
+                    AVG(rx), AVG(tx), AVG(rxp), AVG(txp), {peaks}, AVG(tcp), AVG(udp), AVG(ips)
              FROM {table} WHERE vm = ?2 AND ts >= ?3 GROUP BY b ORDER BY b"
         );
         let db = self.db.lock().unwrap();
@@ -206,11 +239,15 @@ impl History {
                     tx: r.get(9)?,
                     rxp: r.get(10)?,
                     txp: r.get(11)?,
+                    tcp: r.get(17)?,
+                    udp: r.get(18)?,
+                    ips: r.get(19)?,
                 },
                 cpu_max: r.get(12)?,
                 rx_max: r.get(13)?,
                 tx_max: r.get(14)?,
                 wr_max: r.get(15)?,
+                conns_max: r.get(16)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -223,7 +260,8 @@ impl History {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare_cached(
             "SELECT vm, MAX(ts), AVG(cpu), AVG(mem), MAX(disk), AVG(rd), AVG(wr), AVG(rio), AVG(wio),
-                    AVG(rx), AVG(tx), AVG(rxp), AVG(txp), MAX(cpu), COUNT(*)
+                    AVG(rx), AVG(tx), AVG(rxp), AVG(txp), MAX(cpu), COUNT(*),
+                    AVG(tcp), AVG(udp), AVG(ips), MAX(tcp + COALESCE(udp, 0))
              FROM samples WHERE ts >= ?1 GROUP BY vm",
         )?;
         let rows = stmt.query_map([from], |r| {
@@ -242,8 +280,12 @@ impl History {
                     tx: r.get(10)?,
                     rxp: r.get(11)?,
                     txp: r.get(12)?,
+                    tcp: r.get(15)?,
+                    udp: r.get(16)?,
+                    ips: r.get(17)?,
                 },
                 cpu_max: r.get(13)?,
+                conns_max: r.get(18)?,
                 samples: r.get::<_, i64>(14)? as u64,
             })
         })?;
@@ -315,5 +357,55 @@ mod tests {
         h.forget("a").unwrap();
         assert!(h.series("a", LONG, now + RAW_KEEP).unwrap().is_empty());
         assert!(h.series("a", 0, now).is_err());
+    }
+
+    #[test]
+    fn connections_roll_up_and_old_rows_stay_unmeasured() {
+        // A database from before the connection columns.
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE samples (
+                 vm TEXT NOT NULL, ts INTEGER NOT NULL,
+                 cpu REAL, mem INTEGER, disk INTEGER, rd REAL, wr REAL, rio REAL, wio REAL,
+                 rx REAL, tx REAL, rxp REAL, txp REAL,
+                 PRIMARY KEY (vm, ts)) WITHOUT ROWID;
+             CREATE TABLE rollups (
+                 vm TEXT NOT NULL, ts INTEGER NOT NULL,
+                 cpu REAL, mem INTEGER, disk INTEGER, rd REAL, wr REAL, rio REAL, wio REAL,
+                 rx REAL, tx REAL, rxp REAL, txp REAL,
+                 cpu_max REAL, rx_max REAL, tx_max REAL, wr_max REAL,
+                 PRIMARY KEY (vm, ts)) WITHOUT ROWID;
+             INSERT INTO samples VALUES ('old', 1800000000, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);",
+        )
+        .unwrap();
+        let h = History::init(db).unwrap();
+
+        let t0 = 1_800_000_000 / ROLLUP_SECS * ROLLUP_SECS;
+        let conns = |ts, tcp, udp| Sample {
+            ts,
+            tcp: Some(tcp),
+            udp,
+            ips: Some(2.0),
+            ..Default::default()
+        };
+        h.record(&[
+            ("a".into(), conns(t0, 10.0, Some(4.0))),
+            ("a".into(), conns(t0 + 60, 20.0, None)),
+        ])
+        .unwrap();
+        let now = t0 + ROLLUP_SECS;
+
+        let usage = h.usage(ROLLUP_SECS, now).unwrap();
+        let old = usage.iter().find(|u| u.vm_id == "old");
+        assert!(old.is_none_or(|u| u.avg.tcp.is_none() && u.conns_max.is_none()));
+        let a = usage.iter().find(|u| u.vm_id == "a").unwrap();
+        assert_eq!(a.avg.tcp, Some(15.0));
+        assert_eq!(a.avg.udp, Some(4.0));
+        assert_eq!(a.conns_max, Some(20.0), "missing UDP counts as none");
+
+        h.maintain(now).unwrap();
+        let long = h.series("a", RAW_KEEP + 3600, now).unwrap();
+        assert_eq!(long[0].avg.tcp, Some(15.0));
+        assert_eq!(long[0].conns_max, Some(20.0));
     }
 }

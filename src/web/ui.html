@@ -43,6 +43,13 @@ td.warm { color: var(--warn); }
 .chart canvas { width: 100%; height: 150px; display: block; }
 .legend { font-size: 12px; color: var(--muted); }
 .legend i { display: inline-block; width: 10px; height: 3px; margin: 0 4px 2px 8px; vertical-align: middle; }
+.legend button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+.legend button.off { opacity: .4; text-decoration: line-through; }
+.chart { position: relative; }
+.chart canvas { touch-action: pan-y; cursor: crosshair; }
+.chart-tip { position: absolute; z-index: 2; pointer-events: none; white-space: nowrap; font-size: 12px; padding: 4px 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.chart-tip[hidden] { display: none; }
+.chart-tip i { display: inline-block; width: 10px; height: 3px; margin-right: 4px; vertical-align: middle; }
 tr:last-child td { border-bottom: 0; }
 .table-wrap { overflow-x: auto; }
 code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
@@ -389,6 +396,8 @@ $('#tab-instances').addEventListener('click', async e => {
 // ── monitoring ──
 const bits = n => { n = Number(n) || 0; const u = ['bit/s', 'Kbit/s', 'Mbit/s', 'Gbit/s']; let i = 0; while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
 const count = n => { n = Number(n) || 0; return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : n.toFixed(n < 10 ? 1 : 0); };
+// Connections and addresses come in whole numbers, even when averaged.
+const whole = n => { n = Number(n) || 0; return n >= 1e3 ? count(n) : String(Math.round(n)); };
 let monitorWindow = 3600, monitorSort = 'cpu';
 // Sort keys and how a row's value is read.
 const MONITOR_COLS = {
@@ -398,6 +407,7 @@ const MONITOR_COLS = {
   io: r => r.usage ? r.usage.rd + r.usage.wr : -1,
   net: r => r.usage ? r.usage.rx + r.usage.tx : -1,
   pps: r => r.usage ? r.usage.rxp + r.usage.txp : -1,
+  conns: r => r.usage ? (r.usage.tcp ?? -1) + (r.usage.udp ?? 0) : -1,
 };
 
 async function loadMonitor() {
@@ -411,13 +421,13 @@ async function loadMonitor() {
       <div class="row">
         <label>统计区间<select id="monitor-window">${[[300, '最近 5 分钟'], [3600, '最近 1 小时'], [86400, '最近 24 小时']]
           .map(([v, n]) => `<option value="${v}"${v === monitorWindow ? ' selected' : ''}>${n}</option>`).join('')}</select></label>
-        <span class="muted">每分钟采样一次，表中是区间内的平均值；点表头排序，点「图表」看历史（最长 30 天）。持续高 CPU、高包速或上行跑满带宽的实例会标出颜色。</span>
+        <span class="muted">每分钟采样一次，表中是区间内的平均值；连接数是已建立的 TCP 连接加 UDP 流，含实例主动发起的连接，不含实例内部回环；点表头排序，点「图表」看历史（最长 30 天）。持续高 CPU、高包速或上行跑满带宽的实例会标出颜色。</span>
       </div>
       <div class="table-wrap section"><table>
-        <tr><th>实例</th>${th('cpu', 'CPU')}${th('mem', '内存')}${th('disk', '磁盘')}${th('io', '磁盘读 / 写')}${th('net', '网络入 / 出')}${th('pps', '包速 入 / 出')}<th></th></tr>
+        <tr><th>实例</th>${th('cpu', 'CPU')}${th('mem', '内存')}${th('disk', '磁盘')}${th('io', '磁盘读 / 写')}${th('net', '网络入 / 出')}${th('pps', '包速 入 / 出')}${th('conns', '连接数')}<th></th></tr>
         ${rows.map(r => {
           const u = r.usage;
-          if (!u) return `<tr data-id="${esc(r.id)}"><td><div>${esc(r.hostname)}</div><div class="muted mono">${esc(r.id)}</div></td><td colspan="6" class="muted">${r.status === 'running' ? '采样中，约 2 分钟后有数据' : '未运行，区间内没有数据'}</td><td><button class="btn" data-act="chart">图表</button></td></tr>`;
+          if (!u) return `<tr data-id="${esc(r.id)}"><td><div>${esc(r.hostname)}</div><div class="muted mono">${esc(r.id)}</div></td><td colspan="7" class="muted">${r.status === 'running' ? '采样中，约 2 分钟后有数据' : '未运行，区间内没有数据'}</td><td><button class="btn" data-act="chart">图表</button></td></tr>`;
           const memPct = u.mem / (r.ram_mb * 1048576) * 100, diskPct = u.disk / (r.disk_gb * 1073741824) * 100;
           const upPct = r.bandwidth_mbps ? u.tx / (r.bandwidth_mbps * 1e6) * 100 : 0;
           return `<tr data-id="${esc(r.id)}">
@@ -428,8 +438,9 @@ async function loadMonitor() {
             <td class="${cls(u.rio + u.wio, 500, 2000)}">${rate(u.rd)} / ${rate(u.wr)}<div class="muted">${count(u.rio)} / ${count(u.wio)} IOPS</div></td>
             <td class="${cls(upPct, 70, 90)}">${bits(u.rx)} / ${bits(u.tx)}${r.bandwidth_mbps ? `<div class="muted">限速 ${r.bandwidth_mbps} Mbps</div>` : ''}</td>
             <td class="${cls(u.rxp + u.txp, 20000, 100000)}">${count(u.rxp)} / ${count(u.txp)} pps</td>
+            <td>${u.tcp == null ? '<span class="muted">暂无数据</span>' : `${whole(u.tcp + (u.udp ?? 0))}<div class="muted">TCP ${whole(u.tcp)}${u.udp == null ? '' : ` · UDP ${whole(u.udp)}`}</div><div class="muted">峰值 ${whole(u.conns_max)} · 对端 ${whole(u.ips)} 个 IP</div>`}</td>
             <td><button class="btn" data-act="chart">图表</button></td></tr>`;
-        }).join('') || '<tr><td colspan="8" class="muted">此节点上还没有实例。</td></tr>'}
+        }).join('') || '<tr><td colspan="9" class="muted">此节点上还没有实例。</td></tr>'}
       </table></div>`;
   } catch (e) { el.textContent = e.message; }
 }
@@ -444,36 +455,74 @@ $('#tab-monitor').addEventListener('click', e => {
   if (b) showCharts(b.closest('tr').dataset.id);
 });
 
-// Line chart on a canvas: series of [{ts, v}], one or two lines.
-function drawChart(canvas, lines, fmt) {
+// Line chart on a canvas: series of [{ts, v}]. Pointing at it (or tapping)
+// shows the values at that moment; legend entries switch their line on and off.
+function drawChart(canvas, lines, fmt, integer) {
   const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
   canvas.width = w * dpr; canvas.height = h * dpr;
   const g = canvas.getContext('2d'); g.scale(dpr, dpr);
   const css = getComputedStyle(document.documentElement), color = n => css.getPropertyValue(n).trim();
-  const pts = lines.flatMap(l => l.points);
-  g.font = '11px system-ui, sans-serif'; g.fillStyle = color('--muted');
-  if (!pts.length) { g.fillText('没有数据', w / 2 - 24, h / 2); return; }
-  const t0 = Math.min(...pts.map(p => p.ts)), t1 = Math.max(...pts.map(p => p.ts));
-  const max = Math.max(...pts.map(p => p.v), 1e-9) * 1.1;
-  const L = 64, R = 8, T = 8, B = 18, x = t => L + (t1 > t0 ? (t - t0) / (t1 - t0) : 0.5) * (w - L - R), y = v => T + (1 - v / max) * (h - T - B);
-  g.strokeStyle = color('--line'); g.lineWidth = 1;
-  for (let i = 0; i <= 3; i++) {
-    const v = max * i / 3, yy = Math.round(y(v)) + 0.5;
-    g.beginPath(); g.moveTo(L, yy); g.lineTo(w - R, yy); g.stroke();
-    g.fillText(fmt(v), 4, yy + 4);
-  }
-  const span = t1 - t0, label = t => { const d = new Date(t * 1000); return span > 2 * 86400 ? `${d.getMonth() + 1}-${d.getDate()}` : `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
-  g.fillText(label(t0), L, h - 4); const lt = label(t1); g.fillText(lt, w - R - g.measureText(lt).width, h - 4);
-  for (const l of lines) {
-    g.strokeStyle = color(l.color); g.lineWidth = 1.5; g.beginPath();
-    let prev = null;
-    for (const p of l.points) {
-      // Break the line across gaps (instance stopped).
-      if (prev && p.ts - prev.ts > l.gap) g.moveTo(x(p.ts), y(p.v)); else if (prev) g.lineTo(x(p.ts), y(p.v)); else g.moveTo(x(p.ts), y(p.v));
-      prev = p;
+  const box = canvas.parentElement, tip = box.querySelector('.chart-tip');
+  const all = lines.flatMap(l => l.points);
+  const t0 = Math.min(...all.map(p => p.ts)), t1 = Math.max(...all.map(p => p.ts));
+  const L = 64, R = 8, T = 8, B = 18, x = t => L + (t1 > t0 ? (t - t0) / (t1 - t0) : 0.5) * (w - L - R);
+  const hidden = new Set();
+  let pointer = null; // x of the pointer in the canvas
+
+  function render() {
+    g.clearRect(0, 0, w, h);
+    g.font = '11px system-ui, sans-serif'; g.fillStyle = color('--muted');
+    const shown = lines.filter(l => !hidden.has(l.name)), pts = shown.flatMap(l => l.points);
+    tip.hidden = true;
+    if (!pts.length) { g.fillText('没有数据', w / 2 - 24, h / 2); return; }
+    const top = Math.max(...pts.map(p => p.v), 1e-9) * 1.1;
+    // Three grid steps: a multiple of three keeps whole-number axes whole.
+    const max = integer ? Math.ceil(top / 3) * 3 : top, y = v => T + (1 - v / max) * (h - T - B);
+    g.strokeStyle = color('--line'); g.lineWidth = 1;
+    for (let i = 0; i <= 3; i++) {
+      const v = max * i / 3, yy = Math.round(y(v)) + 0.5;
+      g.beginPath(); g.moveTo(L, yy); g.lineTo(w - R, yy); g.stroke();
+      g.fillText(fmt(v), 4, yy + 4);
     }
-    g.stroke();
+    const span = t1 - t0, label = t => { const d = new Date(t * 1000); return span > 2 * 86400 ? `${d.getMonth() + 1}-${d.getDate()}` : `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+    g.fillText(label(t0), L, h - 4); const lt = label(t1); g.fillText(lt, w - R - g.measureText(lt).width, h - 4);
+    for (const l of shown) {
+      g.strokeStyle = color(l.color); g.lineWidth = 1.5; g.beginPath();
+      let prev = null;
+      for (const p of l.points) {
+        // Break the line across gaps (instance stopped).
+        if (prev && p.ts - prev.ts > l.gap) g.moveTo(x(p.ts), y(p.v)); else if (prev) g.lineTo(x(p.ts), y(p.v)); else g.moveTo(x(p.ts), y(p.v));
+        prev = p;
+      }
+      g.stroke();
+    }
+    if (pointer === null) return;
+    // The sample nearest the pointer, and each line's value at that moment.
+    const near = pts.reduce((a, b) => Math.abs(x(b.ts) - pointer) < Math.abs(x(a.ts) - pointer) ? b : a);
+    const at = shown.flatMap(l => { const p = l.points.find(p => p.ts === near.ts); return p ? [{ l, p }] : []; });
+    const px = Math.round(x(near.ts)) + 0.5;
+    g.strokeStyle = color('--muted'); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(px, T); g.lineTo(px, h - B); g.stroke();
+    for (const { l, p } of at) { g.fillStyle = color(l.color); g.beginPath(); g.arc(x(p.ts), y(p.v), 3, 0, 2 * Math.PI); g.fill(); }
+    tip.innerHTML = `<div class="muted">${esc(new Date(near.ts * 1000).toLocaleString())}</div>` +
+      at.map(({ l, p }) => `<div><i style="background:var(${l.color})"></i>${esc(l.name)} ${esc(fmt(p.v))}</div>`).join('');
+    tip.hidden = false;
+    const left = canvas.offsetLeft + px;
+    tip.style.left = (px > w / 2 ? left - tip.offsetWidth - 10 : left + 10) + 'px';
+    tip.style.top = canvas.offsetTop + T + 'px';
   }
+
+  canvas.onpointermove = canvas.onpointerdown = e => { pointer = e.offsetX; render(); };
+  // On a touch screen the values stay after the finger lifts.
+  canvas.onpointerleave = e => { if (e.pointerType === 'mouse') { pointer = null; render(); } };
+  box.querySelector('.legend').onclick = e => {
+    const b = e.target.closest('button[data-line]'); if (!b) return;
+    const name = b.dataset.line;
+    if (!hidden.delete(name)) hidden.add(name);
+    b.classList.toggle('off', hidden.has(name));
+    render();
+  };
+  render();
 }
 
 const CHART_RANGES = [[3600, '1 小时'], [6 * 3600, '6 小时'], [86400, '24 小时'], [7 * 86400, '7 天'], [30 * 86400, '30 天']];
@@ -485,7 +534,7 @@ async function showCharts(id, range = 3600) {
   try {
     const { points } = await api(`/api/monitor/${id}?range=${range}`);
     const bucket = Math.max(60, range / 360), gap = bucket * 2.5;
-    const s = key => points.map(p => ({ ts: p.ts, v: p[key] }));
+    const s = key => points.filter(p => p[key] != null).map(p => ({ ts: p.ts, v: p[key] }));
     const charts = [
       ['CPU（占分配核数）', [{ name: '平均', color: '--accent', points: s('cpu') }, { name: '峰值', color: '--warn', points: s('cpu_max') }], v => v.toFixed(0) + '%'],
       ['内存', [{ name: '已用', color: '--accent', points: s('mem') }], bytes],
@@ -494,10 +543,12 @@ async function showCharts(id, range = 3600) {
       ['磁盘 IOPS', [{ name: '读', color: '--ok', points: s('rio') }, { name: '写', color: '--warn', points: s('wio') }], count],
       ['网络', [{ name: '入', color: '--ok', points: s('rx') }, { name: '出', color: '--accent', points: s('tx') }], bits],
       ['包速', [{ name: '入', color: '--ok', points: s('rxp') }, { name: '出', color: '--accent', points: s('txp') }], v => count(v) + ' pps'],
+      ['连接数', [{ name: 'TCP', color: '--accent', points: s('tcp') }, { name: 'UDP', color: '--ok', points: s('udp') }, { name: '峰值', color: '--warn', points: s('conns_max') }], whole, true],
+      ['对端 IP 数', [{ name: '平均', color: '--accent', points: s('ips') }], whole, true],
     ];
     const box = $('#charts'); if (!box) return;
-    box.innerHTML = charts.map(([title, lines], i) => `<div class="chart card"><h4>${title}<span class="legend">${lines.map(l => `<i style="background:var(${l.color})"></i>${l.name}`).join('')}</span></h4><canvas id="chart-${i}"></canvas></div>`).join('');
-    charts.forEach(([, lines, fmt], i) => drawChart($('#chart-' + i), lines.map(l => ({ ...l, gap })), fmt));
+    box.innerHTML = charts.map(([title, lines], i) => `<div class="chart card"><h4>${title}<span class="legend">${lines.map(l => `<button data-line="${l.name}" title="点击隐藏或显示"><i style="background:var(${l.color})"></i>${l.name}</button>`).join('')}</span></h4><canvas id="chart-${i}"></canvas><div class="chart-tip" hidden></div></div>`).join('');
+    charts.forEach(([, lines, fmt, integer], i) => drawChart($('#chart-' + i), lines.map(l => ({ ...l, gap })), fmt, integer));
   } catch (err) { const box = $('#charts'); if (box) box.innerHTML = `<p class="muted">${esc(err.message)}</p>`; }
 }
 
