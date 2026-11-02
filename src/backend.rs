@@ -119,6 +119,70 @@ pub trait Monitor: Send + Sync {
     async fn series(&self, vm: &str, range: u64) -> Result<Vec<crate::history::Point>>;
 }
 
+/// Port forwards capped per instance at the configured `max_forwards`
+/// (TCP and UDP together). Wraps the backend, so platform commands, the
+/// panel and the automatic SSH rule all go through it.
+pub struct LimitedForwards {
+    inner: Arc<dyn PortForwards>,
+    cfg: Arc<crate::config::Store>,
+    /// Serializes adds, so concurrent ones cannot both take the last slot.
+    adding: tokio::sync::Mutex<()>,
+}
+
+/// Refuse `rule` when `vm` already has `max` rules (0 = no limit). A rule
+/// identical to an existing one is a replay, not a new rule.
+pub fn check_forward_limit(existing: &[PortForward], rule: &PortForward, max: u32) -> Result<()> {
+    if max == 0 || existing.iter().any(|f| f == rule) {
+        return Ok(());
+    }
+    let count = existing.iter().filter(|f| f.vm_id == rule.vm_id).count();
+    if count >= max as usize {
+        anyhow::bail!(
+            "instance {} already has {count} port forwards (limit {max})",
+            rule.vm_id
+        );
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl PortForwards for LimitedForwards {
+    async fn add(&self, rule: PortForward) -> Result<()> {
+        let _adding = self.adding.lock().await;
+        let existing = self.inner.list(Some(&rule.vm_id)).await?;
+        check_forward_limit(&existing, &rule, self.cfg.get().max_forwards)?;
+        self.inner.add(rule).await
+    }
+
+    async fn remove(&self, id: &VmId, proto: L4Proto, host_port: u16) -> Result<()> {
+        self.inner.remove(id, proto, host_port).await
+    }
+
+    async fn list(&self, id: Option<&VmId>) -> Result<Vec<PortForward>> {
+        self.inner.list(id).await
+    }
+
+    async fn remove_all(&self, id: &VmId) -> Result<()> {
+        self.inner.remove_all(id).await
+    }
+
+    async fn free_port(&self) -> Result<u16> {
+        self.inner.free_port().await
+    }
+}
+
+impl Services {
+    /// Enforce `max_forwards` from `cfg` on every port forward added.
+    pub fn with_forward_limit(mut self, cfg: Arc<crate::config::Store>) -> Self {
+        self.port_forwards = Arc::new(LimitedForwards {
+            inner: self.port_forwards,
+            cfg,
+            adding: tokio::sync::Mutex::new(()),
+        });
+        self
+    }
+}
+
 /// Every instance gets a random host port forwarded to SSH (22/tcp), as the
 /// Go agent did. Failure is logged, not fatal: the instance itself exists.
 /// Returns the host port of the SSH forward, if there is one.

@@ -45,7 +45,12 @@ async fn start_opts(ping_every: Option<Duration>, timing: Timing, wg_silent: boo
         token: TOKEN.into(),
         ..Config::default()
     };
-    let agent = Agent::new(Store::in_memory(cfg), fake.services(), timing);
+    let store = Store::in_memory(cfg);
+    let agent = Agent::new(
+        store.clone(),
+        fake.services().with_forward_limit(store),
+        timing,
+    );
     let shutdown = CancellationToken::new();
     tokio::spawn(agent.clone().run(shutdown.clone()));
     Harness {
@@ -152,6 +157,43 @@ async fn create_acks_reports_vm_and_adds_ssh_forward() {
     assert_eq!(list.entries.len(), 1);
     assert_eq!(list.entries[0].guest_port, 22);
     assert_eq!(list.entries[0].protocol, proto::Protocol::Tcp as i32);
+}
+
+#[tokio::test]
+async fn platform_port_forwards_obey_the_default_limit() {
+    let mut h = start(Some(Duration::from_millis(100)), fast()).await;
+    h.mock.expect_connected(WAIT).await;
+    let fwd = |port: i32, protocol: proto::Protocol| {
+        Down::SetPortFwd(proto::CmdSetPortForward {
+            vm_id: VM.into(),
+            protocol: protocol as i32,
+            host_port: port,
+            guest_port: 80,
+            description: String::new(),
+        })
+    };
+    for i in 0..20 {
+        let protocol = if i % 2 == 0 {
+            proto::Protocol::Tcp
+        } else {
+            proto::Protocol::Udp
+        };
+        h.mock
+            .send(&format!("f{i}"), fwd(40000 + i, protocol))
+            .await;
+        assert!(
+            result_for(&mut h.mock, &format!("f{i}")).await.success,
+            "rule {i}"
+        );
+    }
+    h.mock.send("f20", fwd(40020, proto::Protocol::Udp)).await;
+    let r = result_for(&mut h.mock, "f20").await;
+    assert!(!r.success);
+    assert!(r.error.contains("limit 20"), "{}", r.error);
+    // The platform replaying a command it already sent still succeeds.
+    h.mock.send("again", fwd(40000, proto::Protocol::Tcp)).await;
+    assert!(result_for(&mut h.mock, "again").await.success);
+    assert_eq!(h.fake.rules.lock().unwrap().len(), 20);
 }
 
 #[tokio::test]

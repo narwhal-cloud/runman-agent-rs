@@ -10,6 +10,9 @@ pub const DEFAULT_PATH: &str = "/etc/runman-agent/config.toml";
 pub const DEFAULT_PLATFORM_URL: &str = "https://hosting.fuckip.me:443";
 pub const DEFAULT_UPDATE_URL: &str =
     "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous";
+pub const DEFAULT_MAX_FORWARDS: u32 = 20;
+/// Highest `max_forwards`: more than a host has ports to give.
+pub const MAX_FORWARDS_LIMIT: u32 = 65535;
 pub const DEFAULT_IMAGE_BASE_URL: &str =
     "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/images";
 
@@ -40,6 +43,9 @@ pub struct Config {
     pub traffic_reset_day: u32,
     /// UTC offset (`+08:00`) whose midnight starts the reset day.
     pub traffic_timezone: String,
+    /// Port forwards per instance, TCP and UDP together (0 = no limit).
+    /// Existing rules stay when it is lowered; only new ones are refused.
+    pub max_forwards: u32,
     /// Correction of the measured uplink bandwidth reported to the platform
     /// (Mbit/s; 0 = report the speed test, see `speedtest`).
     pub bandwidth_mbps: u32,
@@ -121,6 +127,7 @@ impl Default for Config {
             traffic_reset_mode: crate::traffic::ResetMode::Fixed,
             traffic_reset_day: 1,
             traffic_timezone: "+00:00".into(),
+            max_forwards: DEFAULT_MAX_FORWARDS,
             bandwidth_mbps: 0,
             web_listen: "0.0.0.0:8792".into(),
             web_user: "admin".into(),
@@ -155,6 +162,9 @@ impl Config {
             bail!("traffic_reset_day must be 1-28");
         }
         parse_utc_offset(&self.traffic_timezone)?;
+        if self.max_forwards > MAX_FORWARDS_LIMIT {
+            bail!("max_forwards must be 0-{MAX_FORWARDS_LIMIT}");
+        }
         if self.token.chars().any(char::is_control) {
             bail!("token must not contain control characters");
         }

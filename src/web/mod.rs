@@ -964,6 +964,7 @@ async fn get_settings(State(web): State<Arc<Web>>) -> Json<Value> {
         "bandwidth_mbps": c.bandwidth_mbps,
         "virt_label": c.virt_label,
         "web_user": c.web_user,
+        "max_forwards": c.max_forwards,
         "token_hint": token_hint,
         "traffic": traffic_info(&c),
         "bandwidth": bandwidth_info(&web, &c),
@@ -997,6 +998,7 @@ struct SettingsReq {
     traffic_reset_mode: Option<crate::traffic::ResetMode>,
     traffic_reset_day: Option<u32>,
     traffic_timezone: Option<String>,
+    max_forwards: Option<u32>,
 }
 
 async fn put_settings(
@@ -1025,6 +1027,15 @@ async fn put_settings(
     if let Some(tz) = &req.traffic_timezone {
         config::parse_utc_offset(tz).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     }
+    if req
+        .max_forwards
+        .is_some_and(|m| m > config::MAX_FORWARDS_LIMIT)
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("max forwards must be 0-{}", config::MAX_FORWARDS_LIMIT),
+        ));
+    }
     web.cfg().update(|c| {
         if let Some(h) = req.host {
             c.host = h;
@@ -1040,6 +1051,9 @@ async fn put_settings(
         }
         if let Some(tz) = req.traffic_timezone {
             c.traffic_timezone = tz;
+        }
+        if let Some(m) = req.max_forwards {
+            c.max_forwards = m;
         }
     })?;
     info!("panel: settings updated");

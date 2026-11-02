@@ -203,6 +203,7 @@ async fn agent_main() -> Result<()> {
             }
         }
     };
+    let services = services.with_forward_limit(store.clone());
     let agent = Agent::new(store.clone(), services.clone(), Timing::default());
 
     let shutdown = CancellationToken::new();

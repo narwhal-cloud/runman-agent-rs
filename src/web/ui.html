@@ -848,6 +848,13 @@ async function loadSettings() {
         </form>
       </div>
       <div class="card section"><h2>节点带宽</h2>${bandwidthCard(s.bandwidth)}</div>
+      <div class="card section"><h2>端口转发</h2>
+        <form class="row" id="forwards-form">
+          <label>每个实例最多（TCP 与 UDP 合计，0 = 不限制）<input name="max_forwards" type="number" min="0" max="65535" required value="${esc(s.max_forwards)}" style="width:110px"></label>
+          <button class="btn primary">保存</button>
+        </form>
+        <p class="muted">包括新建实例时自动分配的 SSH 端口。平台下发和本面板添加的转发都受此限制；调低后已有的转发保留，只拒绝新增。</p>
+      </div>
       <div class="card section"><h2>流量统计</h2>
         <form class="row" id="traffic-form">
           <label>重置方式<select name="traffic_reset_mode">
@@ -905,6 +912,9 @@ $('#tab-settings').addEventListener('submit', async e => {
     } else if (e.target.id === 'bandwidth-form') {
       await api('/api/settings', { method: 'PUT', body: { bandwidth_mbps: +f.get('bandwidth_mbps') } });
       toast('带宽已保存');
+    } else if (e.target.id === 'forwards-form') {
+      await api('/api/settings', { method: 'PUT', body: { max_forwards: +f.get('max_forwards') } });
+      toast('端口转发上限已保存');
     } else if (e.target.id === 'traffic-form') {
       await api('/api/settings', { method: 'PUT', body: { traffic_reset_mode: f.get('traffic_reset_mode'), traffic_reset_day: +f.get('traffic_reset_day'), traffic_timezone: f.get('traffic_timezone') } });
       toast('流量重置设置已保存');

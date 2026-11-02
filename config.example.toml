@@ -13,6 +13,7 @@ tun = true                  # expose /dev/net/tun to instances
 traffic_reset_mode = "fixed" # "fixed": all instances on traffic_reset_day; "creation": each on its creation day
 traffic_reset_day = 1       # day of month (1-28) monthly traffic starts again
 traffic_timezone = "+00:00" # UTC offset whose midnight starts that day, e.g. "+08:00"
+max_forwards = 20           # port forwards per instance, TCP and UDP together; 0 = no limit
 bandwidth_mbps = 0          # 0 = report the speed test; else a correction (max 2x the test)
 
 web_listen = "0.0.0.0:8792" # management panel; "" disables, 127.0.0.1:8792 = SSH tunnel only

@@ -62,14 +62,15 @@ async fn start_with_token(token: &str) -> Panel {
     };
     let store = Store::in_memory(cfg);
     let fake = Fake::new();
-    let agent = Agent::new(store.clone(), fake.services(), Timing::default());
+    let services = fake.services().with_forward_limit(store.clone());
+    let agent = Agent::new(store.clone(), services.clone(), Timing::default());
     let local_wg = std::sync::Arc::new(
         LocalWg::load(
             &std::env::temp_dir().join(format!("runman-web-test-{}", uuid::Uuid::new_v4())),
         )
         .unwrap(),
     );
-    let web = Web::new(agent, fake.services(), None, local_wg);
+    let web = Web::new(agent, services, None, local_wg);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let shutdown = CancellationToken::new();
@@ -776,4 +777,51 @@ async fn monitoring_needs_a_capable_backend() {
         let r = c.get(format!("{}{path}", p.base)).send().await.unwrap();
         assert_eq!(r.status(), 501, "{path}");
     }
+}
+
+#[tokio::test]
+async fn port_forwards_are_capped_per_instance() {
+    let p = start_with_token("").await;
+    let c = client();
+    login(&p, &c, PASSWORD).await;
+    let add = |proto: &'static str, host_port: u16| {
+        post(
+            &c,
+            format!("{}/api/instances/{VM}/forwards", p.base),
+            json!({"proto": proto, "host_port": host_port, "guest_port": 80}),
+        )
+    };
+    let set_max = |m: Value| {
+        c.put(format!("{}/api/settings", p.base))
+            .header("X-Runman", "1")
+            .json(&json!({ "max_forwards": m }))
+            .send()
+    };
+    let s: Value = c
+        .get(format!("{}/api/settings", p.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["max_forwards"], 20, "default");
+
+    assert_eq!(set_max(json!(3)).await.unwrap().status(), 200);
+    // TCP and UDP count together.
+    for (proto, port) in [("tcp", 30001), ("udp", 30001), ("tcp", 30002)] {
+        assert_eq!(add(proto, port).await.status(), 200, "{proto}/{port}");
+    }
+    let r = add("udp", 30003).await;
+    assert_eq!(r.status(), 400);
+    assert!(r.text().await.unwrap().contains("limit 3"));
+    // Replaying an existing rule is not a new one.
+    assert_eq!(add("tcp", 30002).await.status(), 200);
+
+    // Lowering keeps existing rules; 0 lifts the limit.
+    assert_eq!(set_max(json!(1)).await.unwrap().status(), 200);
+    assert_eq!(p.fake.rules.lock().unwrap().len(), 3);
+    assert_eq!(set_max(json!(0)).await.unwrap().status(), 200);
+    assert_eq!(add("udp", 30003).await.status(), 200);
+    assert_eq!(set_max(json!(70000)).await.unwrap().status(), 400);
 }
