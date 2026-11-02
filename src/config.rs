@@ -43,7 +43,8 @@ pub struct Config {
     /// Correction of the measured uplink bandwidth reported to the platform
     /// (Mbit/s; 0 = report the speed test, see `speedtest`).
     pub bandwidth_mbps: u32,
-    /// Management panel; empty `web_listen` disables it.
+    /// Management panel; empty `web_listen` disables it. `0.0.0.0` and
+    /// `[::]` both listen on every address, IPv4 and IPv6.
     pub web_listen: String,
     pub web_user: String,
     /// bcrypt hash (`runman-agent set-password`).

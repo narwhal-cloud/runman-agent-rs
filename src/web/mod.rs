@@ -1,4 +1,5 @@
-//! Local management panel (`web_listen`, default `0.0.0.0:8792`).
+//! Local management panel (`web_listen`, default `0.0.0.0:8792`: every
+//! address, IPv4 and IPv6).
 //!
 //! - Session login (bcrypt password from the config), HttpOnly +
 //!   SameSite=Strict cookie, failed logins rate-limited per client address.
@@ -11,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -107,10 +109,10 @@ impl Web {
         listen: SocketAddr,
         shutdown: CancellationToken,
     ) -> Result<()> {
-        let listener = tokio::net::TcpListener::bind(listen)
+        let listener = bind(listen)
             .await
             .with_context(|| format!("bind {listen}"))?;
-        info!("management panel on http://{listen}");
+        info!("management panel on http://{}", listener.local_addr()?);
         self.serve_on(listener, shutdown).await
     }
 
@@ -242,6 +244,52 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
         })
 }
 
+/// Listen on `addr`. `0.0.0.0` and `[::]` both mean every address, IPv4 and
+/// IPv6 (existing configs say `0.0.0.0`), falling back to IPv4 on hosts
+/// without IPv6. A specific address is used as it is.
+async fn bind(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    if !addr.ip().is_unspecified() {
+        return tokio::net::TcpListener::bind(addr).await;
+    }
+    match bind_dual_stack(addr.port()) {
+        Err(e) if e.kind() != std::io::ErrorKind::AddrInUse => {
+            warn!("panel: no IPv6, listening on IPv4 only: {e}");
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, addr.port())).await
+        }
+        bound => bound,
+    }
+}
+
+fn bind_dual_stack(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v6()?;
+    socket.set_reuseaddr(true)?;
+    // Whatever `net.ipv6.bindv6only` says.
+    let v6only: libc::c_int = 0;
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            (&raw const v6only).cast(),
+            std::mem::size_of_val(&v6only) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    socket.bind((std::net::Ipv6Addr::UNSPECIFIED, port).into())?;
+    socket.listen(1024)
+}
+
+/// Who failed logins are counted against. IPv6 clients usually control a
+/// whole /64, so counting single addresses would not slow them down.
+fn login_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !0u128 << 64).into()),
+        v4 => v4,
+    }
+}
+
 /// Same-origin check for WebSocket upgrades (browsers cannot add custom
 /// headers to them, so the X-Runman check does not apply).
 fn same_origin(headers: &HeaderMap) -> bool {
@@ -291,10 +339,12 @@ async fn login(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginReq>,
 ) -> ApiResult<Response> {
-    let ip = peer.ip();
+    // Dual-stack sockets report IPv4 clients as ::ffff:a.b.c.d.
+    let ip = peer.ip().to_canonical();
+    let key = login_key(ip);
     {
         let mut failures = web.failures.lock().unwrap();
-        let list = failures.entry(ip).or_default();
+        let list = failures.entry(key).or_default();
         list.retain(|t| t.elapsed() < LOGIN_WINDOW);
         if list.len() >= LOGIN_MAX_FAILURES {
             return Err(err(
@@ -320,13 +370,13 @@ async fn login(
         web.failures
             .lock()
             .unwrap()
-            .entry(ip)
+            .entry(key)
             .or_default()
             .push(Instant::now());
         warn!("panel: failed login for {:?} from {ip}", req.username);
         return Err(err(StatusCode::UNAUTHORIZED, "wrong username or password"));
     }
-    web.failures.lock().unwrap().remove(&ip);
+    web.failures.lock().unwrap().remove(&key);
     let token = random_token(48);
     web.sessions
         .lock()
@@ -1183,4 +1233,42 @@ async fn forward_rfw(
         .await
         .map_err(|_| anyhow!("timeout"))??;
     Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unspecified_address_listens_on_both_families() {
+        for any in ["0.0.0.0:0", "[::]:0"] {
+            let listener = bind(any.parse().unwrap()).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            assert!(listener.local_addr().unwrap().is_ipv6(), "{any}");
+            for client in [format!("127.0.0.1:{port}"), format!("[::1]:{port}")] {
+                tokio::net::TcpStream::connect(client).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn specific_address_stays_on_it() {
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(listener.local_addr().unwrap().is_ipv4());
+        assert!(
+            tokio::net::TcpStream::connect(format!("[::1]:{port}"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_logins_count_per_address_or_v6_network() {
+        let key = |s: &str| login_key(s.parse().unwrap());
+        assert_eq!(key("198.51.100.7"), key("::ffff:198.51.100.7"));
+        assert_ne!(key("198.51.100.7"), key("198.51.100.8"));
+        assert_eq!(key("2001:db8:0:1::1"), key("2001:db8:0:1:ffff::2"));
+        assert_ne!(key("2001:db8:0:1::1"), key("2001:db8:0:2::1"));
+    }
 }

@@ -44,7 +44,8 @@ Usage: install.sh [options]
                           standalone: it never contacts the platform and is
                           managed entirely from its own panel
   --platform-url URL      Platform gRPC endpoint (default: https://hosting.fuckip.me:443)
-  --web-listen ADDR       Management panel address (default 0.0.0.0:8792;
+  --web-listen ADDR       Management panel address (default 0.0.0.0:8792, which
+                          covers IPv4 and IPv6;
                           use 127.0.0.1:8792 to reach it only through an SSH tunnel)
   --no-web                Disable the management panel
   --ipv6 MODE             auto (default), none, snat or subnet

@@ -36,7 +36,7 @@ bash install.sh --token '<平台下发的 Token>'      # 接入平台
 | 参数 | 说明 |
 |---|---|
 | `--token TOKEN` | 平台下发的 Token；省略则以独立模式运行 |
-| `--web-listen 127.0.0.1:8792` | 面板只监听本机，通过 `ssh -L` 访问（推荐公网节点使用） |
+| `--web-listen 127.0.0.1:8792` | 面板只监听本机，通过 `ssh -L` 访问（推荐公网节点使用）。默认的 `0.0.0.0:8792` 同时监听 IPv4 和 IPv6，没有 IPv6 的主机只监听 IPv4 |
 | `--ipv6 auto\|none\|snat\|subnet` | 默认 `auto`：实测整段 /64 能否作为源地址后选择 `subnet`，否则 `snat` 或 `none` |
 | `--ipv6-prefix CIDR --ipv6-uplink IFACE` | 手工指定 `subnet` 前缀 |
 | `--bandwidth MBPS` | 修正上报给平台的带宽（默认上报测速结果，见下文） |
