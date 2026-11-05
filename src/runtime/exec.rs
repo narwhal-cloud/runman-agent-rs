@@ -106,6 +106,10 @@ fn helper(args: &[OsString]) -> Result<i32> {
 
 fn exec_child(argv: &[CString]) -> anyhow::Error {
     let res = (|| -> Result<()> {
+        // Nothing but stdio may reach the instance: an fd inherited from the
+        // agent (another session's pty, a socket) would keep it open, or
+        // hand the instance access to it. Best effort: needs Linux 5.9.
+        unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) };
         nix::unistd::setsid()?;
         if nix::unistd::isatty(std::io::stdin())? {
             unsafe { libc::ioctl(0, libc::TIOCSCTTY, 0) };
@@ -263,8 +267,7 @@ impl ExecTarget {
 
     /// Start an interactive login shell on a fresh pty.
     pub fn console(&self, size: Option<ConsoleSize>) -> Result<ConsoleIo> {
-        let ws = size.map(winsize);
-        let pty = nix::pty::openpty(ws.as_ref(), None)?;
+        let pty = open_pty(size.map(winsize).as_ref())?;
         let shell = "if [ -x /bin/bash ]; then exec /bin/bash -l; else exec /bin/sh -l; fi";
         let mut cmd = self.command(&["/bin/sh", "-c", shell]);
         cmd.stdin(Stdio::from(pty.slave.try_clone()?))
@@ -339,6 +342,35 @@ impl ExecTarget {
             resize: resize_tx,
         })
     }
+}
+
+struct Pty {
+    master: OwnedFd,
+    slave: OwnedFd,
+}
+
+/// Open a pty pair with both ends close-on-exec, atomically. `openpty(3)`
+/// leaves them inheritable, so the master leaked into every command spawned
+/// meanwhile, including the console shell itself: with the shell holding its
+/// own master, closing the session never hung it up, and every console left a
+/// login shell (plus its `__exec` helper and a reader thread) behind for good.
+fn open_pty(ws: Option<&libc::winsize>) -> Result<Pty> {
+    use nix::fcntl::OFlag;
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let master = nix::pty::posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC)?;
+    nix::pty::grantpt(&master)?;
+    nix::pty::unlockpt(&master)?;
+    let name = nix::pty::ptsname_r(&master)?;
+    let master = unsafe { OwnedFd::from_raw_fd(master.into_raw_fd()) };
+    let slave = nix::fcntl::open(
+        name.as_str(),
+        OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )?;
+    if let Some(ws) = ws {
+        unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, ws) };
+    }
+    Ok(Pty { master, slave })
 }
 
 fn winsize(s: ConsoleSize) -> libc::winsize {
