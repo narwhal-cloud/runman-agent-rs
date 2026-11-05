@@ -5,7 +5,7 @@
 platform_url = "https://hosting.fuckip.me:443"
 token = ""                  # integration token; set with `runman-agent set-token`
 host = ""                   # entry address in heartbeats; empty = detected public IPv4
-virt_label = "container"    # shown by the platform as the virtualization type
+virt_label = "Runman"       # shown by the platform as the virtualization type
 data_dir = "/var/lib/runman-agent"
 backend = "container"       # "fake" = in-memory, for development only
 image_base_url = "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/images"
@@ -21,7 +21,7 @@ web_user = "admin"
 web_password_hash = ""      # set with `runman-agent set-password`
 rfw_addr = "127.0.0.1:7734"
 
-update_url = "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous"
+update_url = "https://github.com/narwhal-cloud/runman-agent-rs/releases/latest/download" # stable releases; .../releases/download/continuous = builds of main
 auto_update = true
 
 [network]

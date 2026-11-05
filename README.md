@@ -26,7 +26,7 @@ Token 只由平台生成，agent 和安装器从不自行生成。
 要求：Debian 12+ / Ubuntu 22.04+（推荐 Debian 13），内核 ≥ 5.19，systemd 与 cgroup v2，KVM 虚拟机或物理机（不能在 LXC / OpenVZ 容器里运行）。
 
 ```bash
-curl -fsSL https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous/install.sh -o install.sh
+curl -fsSL https://github.com/narwhal-cloud/runman-agent-rs/releases/latest/download/install.sh -o install.sh
 bash install.sh                                  # 独立模式
 bash install.sh --token '<平台下发的 Token>'      # 接入平台
 ```
@@ -64,7 +64,7 @@ bash install.sh --token '<平台下发的 Token>'      # 接入平台
 - `install.sh`
 - `SHA256SUMS`
 
-节点直接从官方 GitHub 仓库的 Release 下载，只安装与 `SHA256SUMS` 校验和匹配、能正常运行的版本，发现新版后随机延迟 0–6 小时再应用，以免整批节点同时重启（面板里可立即更新）。本地编译的版本不会自动更新。
+节点默认只跟随正式版本（`update_url` 指向 `releases/latest/download`，`install.sh` 也从那里下载），`continuous` 只用于测试：需要时在配置里把 `update_url` 改成 `https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous`，安装时可用 `RUNMAN_RELEASE_URL` 环境变量指定。旧版本保存的 `continuous` 默认地址会在启动时自动改回正式版通道。节点直接从官方 GitHub 仓库的 Release 下载，只安装与 `SHA256SUMS` 校验和匹配、能正常运行的版本，发现新版后随机延迟 0–6 小时再应用，以免整批节点同时重启（面板里可立即更新）。本地编译的版本不会自动更新。
 
 
 ## 实例镜像

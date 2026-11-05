@@ -9,7 +9,14 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_PATH: &str = "/etc/runman-agent/config.toml";
 pub const DEFAULT_PLATFORM_URL: &str = "https://hosting.fuckip.me:443";
 pub const DEFAULT_UPDATE_URL: &str =
+    "https://github.com/narwhal-cloud/runman-agent-rs/releases/latest/download";
+/// Former default (pre-release builds of `main`). Configs still carrying it,
+/// e.g. written back by the panel, are moved to the stable channel on load.
+const LEGACY_UPDATE_URL: &str =
     "https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous";
+pub const DEFAULT_VIRT_LABEL: &str = "Runman";
+/// Former default `virt_label`, moved to [`DEFAULT_VIRT_LABEL`] on load.
+const LEGACY_VIRT_LABEL: &str = "container";
 pub const DEFAULT_MAX_FORWARDS: u32 = 20;
 /// Highest `max_forwards`: more than a host has ports to give.
 pub const MAX_FORWARDS_LIMIT: u32 = 65535;
@@ -119,7 +126,7 @@ impl Default for Config {
             platform_url: DEFAULT_PLATFORM_URL.into(),
             token: String::new(),
             host: String::new(),
-            virt_label: "container".into(),
+            virt_label: DEFAULT_VIRT_LABEL.into(),
             data_dir: PathBuf::from("/var/lib/runman-agent"),
             backend: BackendKind::Container,
             image_base_url: DEFAULT_IMAGE_BASE_URL.into(),
@@ -141,6 +148,16 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Rewrite values that older versions stored as defaults.
+    fn migrate(&mut self) {
+        if self.update_url.trim_end_matches('/') == LEGACY_UPDATE_URL {
+            self.update_url = DEFAULT_UPDATE_URL.into();
+        }
+        if self.virt_label == LEGACY_VIRT_LABEL {
+            self.virt_label = DEFAULT_VIRT_LABEL.into();
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !(self.platform_url.starts_with("https://") || self.platform_url.starts_with("http://"))
         {
@@ -215,8 +232,9 @@ impl Store {
         let path = path.into();
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("read config {}", path.display()))?;
-        let cfg: Config =
+        let mut cfg: Config =
             toml::from_str(&raw).with_context(|| format!("parse config {}", path.display()))?;
+        cfg.migrate();
         cfg.validate()?;
         Ok(Arc::new(Self {
             path,
@@ -278,6 +296,35 @@ mod tests {
             toml::from_str(include_str!("../config.example.toml")).expect("parse example");
         assert_eq!(example, Config::default());
         example.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_update_url_moves_to_stable() {
+        let mut cfg = Config {
+            update_url: format!("{LEGACY_UPDATE_URL}/"),
+            ..Config::default()
+        };
+        cfg.migrate();
+        assert_eq!(cfg.update_url, DEFAULT_UPDATE_URL);
+
+        let custom = "https://mirror.example/runman";
+        cfg.update_url = custom.into();
+        cfg.migrate();
+        assert_eq!(cfg.update_url, custom);
+    }
+
+    #[test]
+    fn legacy_virt_label_is_renamed() {
+        let mut cfg = Config {
+            virt_label: LEGACY_VIRT_LABEL.into(),
+            ..Config::default()
+        };
+        cfg.migrate();
+        assert_eq!(cfg.virt_label, DEFAULT_VIRT_LABEL);
+
+        cfg.virt_label = "LXC".into();
+        cfg.migrate();
+        assert_eq!(cfg.virt_label, "LXC");
     }
 
     #[test]

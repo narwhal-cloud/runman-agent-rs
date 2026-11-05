@@ -107,7 +107,7 @@ async fn sends_bearer_token_and_immediate_heartbeat() {
             _ => None,
         })
         .await;
-    assert_eq!(hb.virt_type, "container");
+    assert_eq!(hb.virt_type, "Runman");
     assert_eq!(hb.cpus, 2);
     assert!(hb.timestamp > 0);
     assert_eq!(

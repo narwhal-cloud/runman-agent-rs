@@ -8,7 +8,7 @@
 # binaries and service units are refreshed. It never prompts.
 set -euo pipefail
 
-RELEASE_URL="${RUNMAN_RELEASE_URL:-https://github.com/narwhal-cloud/runman-agent-rs/releases/download/continuous}"
+RELEASE_URL="${RUNMAN_RELEASE_URL:-https://github.com/narwhal-cloud/runman-agent-rs/releases/latest/download}"
 RFW_URL="${RUNMAN_RFW_URL:-https://github.com/narwhal-cloud/runman-agent/releases/download/continuous}"
 PLATFORM_URL="https://hosting.fuckip.me:443"
 CONFIG_DIR=/etc/runman-agent
