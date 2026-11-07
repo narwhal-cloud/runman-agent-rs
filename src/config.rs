@@ -256,8 +256,8 @@ fn stamp(path: &Path) -> Option<Stamp> {
 }
 
 fn read_config(path: &Path) -> Result<Config> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("read config {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
     let mut cfg: Config =
         toml::from_str(&raw).with_context(|| format!("parse config {}", path.display()))?;
     cfg.migrate();
@@ -373,7 +373,9 @@ mod tests {
         assert_eq!(agent.get().web_password_hash, "new-hash");
 
         // A later update by the agent keeps the new hash.
-        agent.update(|c| c.token = "tok-0123456789abcdef".into()).unwrap();
+        agent
+            .update(|c| c.token = "tok-0123456789abcdef".into())
+            .unwrap();
         let on_disk = Store::load(&path).unwrap().get();
         assert_eq!(on_disk.web_password_hash, "new-hash");
         assert_eq!(on_disk.token, "tok-0123456789abcdef");
