@@ -222,23 +222,57 @@ pub fn parse_utc_offset(s: &str) -> Result<i32> {
 }
 
 /// Thread-safe configuration holder that persists updates atomically.
+///
+/// The file is also changed by other processes (`runman-agent set-password`,
+/// `set-token`, manual edits), so every read checks whether it changed on
+/// disk and reloads it. Without this the running agent would keep serving
+/// the old values and write them back on its next `update`.
 pub struct Store {
     path: PathBuf,
-    cfg: RwLock<Config>,
+    cfg: RwLock<Loaded>,
+}
+
+struct Loaded {
+    cfg: Config,
+    /// Identity of the file `cfg` was read from or written to.
+    stamp: Option<Stamp>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    modified: std::time::SystemTime,
+    len: u64,
+    ino: u64,
+}
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some(Stamp {
+        modified: m.modified().ok()?,
+        len: m.len(),
+        ino: m.ino(),
+    })
+}
+
+fn read_config(path: &Path) -> Result<Config> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read config {}", path.display()))?;
+    let mut cfg: Config =
+        toml::from_str(&raw).with_context(|| format!("parse config {}", path.display()))?;
+    cfg.migrate();
+    cfg.validate()?;
+    Ok(cfg)
 }
 
 impl Store {
     pub fn load(path: impl Into<PathBuf>) -> Result<Arc<Self>> {
         let path = path.into();
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read config {}", path.display()))?;
-        let mut cfg: Config =
-            toml::from_str(&raw).with_context(|| format!("parse config {}", path.display()))?;
-        cfg.migrate();
-        cfg.validate()?;
+        let stamp = stamp(&path);
+        let cfg = read_config(&path)?;
         Ok(Arc::new(Self {
             path,
-            cfg: RwLock::new(cfg),
+            cfg: RwLock::new(Loaded { cfg, stamp }),
         }))
     }
 
@@ -246,23 +280,53 @@ impl Store {
     pub fn in_memory(cfg: Config) -> Arc<Self> {
         Arc::new(Self {
             path: PathBuf::new(),
-            cfg: RwLock::new(cfg),
+            cfg: RwLock::new(Loaded { cfg, stamp: None }),
         })
     }
 
+    /// Reload the file if another process changed it. A file that fails to
+    /// parse is ignored (the last good config stays in effect).
+    fn refresh(&self, loaded: &mut Loaded) {
+        if self.path.as_os_str().is_empty() {
+            return;
+        }
+        let now = stamp(&self.path);
+        if now.is_none() || now == loaded.stamp {
+            return;
+        }
+        match read_config(&self.path) {
+            Ok(cfg) => {
+                tracing::info!("config {} changed on disk, reloaded", self.path.display());
+                loaded.cfg = cfg;
+            }
+            Err(e) => tracing::warn!("config changed on disk but was not reloaded: {e:#}"),
+        }
+        loaded.stamp = now;
+    }
+
     pub fn get(&self) -> Config {
-        self.cfg.read().expect("config lock poisoned").clone()
+        {
+            let guard = self.cfg.read().expect("config lock poisoned");
+            if self.path.as_os_str().is_empty() || stamp(&self.path) == guard.stamp {
+                return guard.cfg.clone();
+            }
+        }
+        let mut guard = self.cfg.write().expect("config lock poisoned");
+        self.refresh(&mut guard);
+        guard.cfg.clone()
     }
 
     pub fn update(&self, f: impl FnOnce(&mut Config)) -> Result<()> {
         let mut guard = self.cfg.write().expect("config lock poisoned");
-        let mut next = guard.clone();
+        self.refresh(&mut guard);
+        let mut next = guard.cfg.clone();
         f(&mut next);
         next.validate()?;
         if !self.path.as_os_str().is_empty() {
             write_atomic(&self.path, toml::to_string_pretty(&next)?.as_bytes())?;
+            guard.stamp = stamp(&self.path);
         }
-        *guard = next;
+        guard.cfg = next;
         Ok(())
     }
 }
@@ -289,6 +353,33 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_picks_up_changes_from_other_processes() {
+        let dir = std::env::temp_dir().join(format!("runman-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let base = toml::to_string_pretty(&Config::default()).unwrap();
+        std::fs::write(&path, &base).unwrap();
+
+        let agent = Store::load(&path).unwrap();
+        assert!(agent.get().web_password_hash.is_empty());
+
+        // `runman-agent set-password` runs as a separate process.
+        Store::load(&path)
+            .unwrap()
+            .update(|c| c.web_password_hash = "new-hash".into())
+            .unwrap();
+        assert_eq!(agent.get().web_password_hash, "new-hash");
+
+        // A later update by the agent keeps the new hash.
+        agent.update(|c| c.token = "tok-0123456789abcdef".into()).unwrap();
+        let on_disk = Store::load(&path).unwrap().get();
+        assert_eq!(on_disk.web_password_hash, "new-hash");
+        assert_eq!(on_disk.token, "tok-0123456789abcdef");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn example_config_matches_defaults() {
