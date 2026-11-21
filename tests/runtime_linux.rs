@@ -208,7 +208,12 @@ async fn instance_lifecycle() {
     let after = console_run(&rt, &id, "grep ^root: /etc/shadow | cut -d: -f2").await;
     assert_ne!(before, after);
     assert!(
-        sha_crypt::sha512_check("Second-pass2", &after).is_ok(),
+        sha_crypt::PasswordVerifier::<str>::verify_password(
+            &sha_crypt::ShaCrypt::SHA512,
+            b"Second-pass2",
+            &after
+        )
+        .is_ok(),
         "{after}"
     );
 
@@ -240,7 +245,12 @@ async fn instance_lifecycle() {
     rt.start(&id).await.expect("start");
     let hash = console_run(&rt, &id, "grep ^root: /etc/shadow | cut -d: -f2").await;
     assert!(
-        sha_crypt::sha512_check("Third-pass3", &hash).is_ok(),
+        sha_crypt::PasswordVerifier::<str>::verify_password(
+            &sha_crypt::ShaCrypt::SHA512,
+            b"Third-pass3",
+            &hash
+        )
+        .is_ok(),
         "{hash}"
     );
 

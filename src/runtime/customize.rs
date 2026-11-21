@@ -2,7 +2,7 @@
 //! instance is stopped (no cloud-init, no network needed at create time).
 
 use anyhow::{Context, Result, bail};
-use sha_crypt::{Sha512Params, sha512_simple};
+use sha_crypt::{PasswordHasher, ShaCrypt};
 
 use super::fsutil::RootFs;
 
@@ -334,8 +334,11 @@ fn hosts(hostname: &str) -> String {
 }
 
 pub fn hash_password(password: &str) -> Result<String> {
-    let params = Sha512Params::new(5000).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    sha512_simple(password, &params).map_err(|e| anyhow::anyhow!("hash password: {e:?}"))
+    // SHA-512 crypt, 5000 rounds: `$6$rounds=5000$<salt>$<hash>`.
+    let hash = ShaCrypt::SHA512
+        .hash_password(password.as_bytes())
+        .map_err(|e| anyhow::anyhow!("hash password: {e:?}"))?;
+    Ok(hash.to_string())
 }
 
 /// Replace root's hash in /etc/shadow, keeping every other field and line.
@@ -399,6 +402,17 @@ mod tests {
     fn hash_verifies() {
         let h = hash_password("Secret-pass1").unwrap();
         assert!(h.starts_with("$6$"));
-        assert!(sha_crypt::sha512_check("Secret-pass1", &h).is_ok());
+        use sha_crypt::PasswordVerifier;
+        assert!(h.starts_with("$6$rounds=5000$"), "{h}");
+        assert!(
+            ShaCrypt::SHA512
+                .verify_password(b"Secret-pass1", h.as_str())
+                .is_ok()
+        );
+        assert!(
+            ShaCrypt::SHA512
+                .verify_password(b"wrong", h.as_str())
+                .is_err()
+        );
     }
 }

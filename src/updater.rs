@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use rand::Rng;
+use rand::RngExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
