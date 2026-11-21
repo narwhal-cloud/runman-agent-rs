@@ -124,8 +124,9 @@ fn exec_child(argv: &[CString]) -> anyhow::Error {
         super::seccomp::install()?;
         // execvp searches the PATH of the current environment.
         unsafe { std::env::set_var("PATH", PATH) };
-        nix::unistd::execvp(&argv[0], argv)?;
-        Ok(())
+        // Returns only on failure (Ok is Infallible).
+        let Err(e) = nix::unistd::execvp(&argv[0], argv);
+        Err(e.into())
     })();
     match res {
         Ok(()) => anyhow!("exec returned"),
