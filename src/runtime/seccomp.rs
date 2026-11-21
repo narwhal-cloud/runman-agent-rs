@@ -120,9 +120,15 @@ mod tests {
         let native = X86_64;
         #[cfg(target_arch = "aarch64")]
         let native = AARCH64;
+        // libc has no SYS_kexec_file_load for aarch64-musl; the kernel's
+        // generic syscall table (asm-generic/unistd.h) puts it at 294.
+        #[cfg(all(target_arch = "aarch64", target_env = "musl"))]
+        let kexec_file_load: libc::c_long = 294;
+        #[cfg(not(all(target_arch = "aarch64", target_env = "musl")))]
+        let kexec_file_load = libc::SYS_kexec_file_load;
         let expected = [
             libc::SYS_kexec_load,
-            libc::SYS_kexec_file_load,
+            kexec_file_load,
             libc::SYS_init_module,
             libc::SYS_finit_module,
             libc::SYS_delete_module,
