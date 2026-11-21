@@ -88,7 +88,7 @@ rfw (独立进程, 127.0.0.1:7734)   eBPF/XDP 防火墙，由 agent 安装与反
 - **隔离**：网桥端口开启 `isolated`，实例之间二层不通（网桥上转发的二层流量不经过 `inet` 表的 forward 链，必须在网桥层面处理）。`bridge runman` 表按「端口 . 源地址」白名单丢弃伪造的 IPv4、ARP、IPv6 源地址，并丢弃实例发出的 RA 和重定向。实例只能经端口转发互访（hairpin NAT 已支持）。
 - **nftables**：独立的 `bridge runman` 和 `inet runman` 两张表，每次变更都整体重新生成，在同一个 `nft -f` 事务里原子替换，不碰其他表。`inet runman` 里有：
   - 出站 masquerade；
-  - 端口转发 map，对外部入站和宿主机本机访问都生效；
+  - 端口转发 map，对外部入站和宿主机本机访问都生效；snat 模式下另有 `fwd6_tcp` / `fwd6_udp`，经宿主机 IPv6 访问的已发布端口 DNAT 到实例的 ULA 地址；
   - 拦截实例从网桥访问宿主机上的服务。
 - **端口转发**：存放在 `portforwards.json`，按实例 ID 记录，所以重装后地址变了也会自动跟随；拒绝宿主机已在监听的端口（例如宿主机的 22）。新建实例时自动在 20000–60000 范围内选一个端口映射到 22。
 - **与 Docker/ufw 共存**：Docker 和 ufw 默认会把 iptables 的 `FORWARD` 策略设成 DROP。iptables-nft 的链和我们的表挂在同一个转发钩子上，任何一处丢弃都会生效，实例会因此全部断网（CI 的 GitHub runner 上实际发生过）。所以每次应用网络规则时，都会在 `FORWARD` 链顶部确保两条规则：`-i/-o <网桥> -m comment --comment runman -j ACCEPT`。隔离和防伪造仍由我们自己的表负责。卸载时删除这两条规则。
@@ -97,7 +97,7 @@ rfw (独立进程, 127.0.0.1:7734)   eBPF/XDP 防火墙，由 agent 安装与反
 - **流量统计**：每 30 秒读一次宿主机 veth 的计数器，按增量累加写入 `traffic.json`；接口索引变化时把计数器视为从零重新开始。每月在 `traffic_reset_day` 号 00:00（`traffic_timezone` 指定的 UTC 偏移，如 `+08:00`）清零本月计数，整台节点统一；或者（`traffic_reset_mode = "creation"`）每个实例在每月的创建日和创建时刻清零，短月份落到月末，创建时间记在实例记录里，重装时连同流量计数一起保留；面板「设置」里可以修改，立即生效。修改时把当前周期的计数改记到新周期名下，已用流量不会被提前清零，而是在新的重置时间归零。平台只读本月入站 + 出站之和判断是否超出套餐，不自己重置。
 - **IPv6**：
   - none：不配置 IPv6；
-  - snat：ULA `fd91:cafe:cafe:10::/64`，经宿主机 masquerade 出站；
+  - snat：ULA `fd91:cafe:cafe:10::/64`，经宿主机 masquerade 出站；已发布端口同时经宿主机 IPv4 和 IPv6 入站（`dnat ip6`，含 hairpin），适用于只有单个 /128 的主机（如 Lightsail）；
   - subnet：从公网前缀分配，实例地址从 `前缀 + 0x10000` 起，每个地址加一条 /128 路由到网桥。前缀和上行网卡在同一链路上时（配置了 `ipv6_ndp_uplink`），用内核 proxy_ndp 为每个地址做 NDP 应答，不再自己实现应答器。
 
   实例里地址都是 /128，网关统一是网桥的 `fe80::1`。subnet 模式已在带同链路 /64 的 Vultr VPS 上实测：实例出站源地址就是它自己的公网地址（无 NAT），外部探针 ping 该地址 0 丢包；删除实例后 NDP 代理条目和路由一并清除。
