@@ -79,6 +79,9 @@ pub struct Forward {
     pub proto: L4Proto,
     pub host_port: u16,
     pub target: Ipv4Addr,
+    /// The instance's IPv6 address; forwarded from the host's IPv6 in snat
+    /// mode (in subnet mode instances are reachable directly).
+    pub target6: Option<Ipv6Addr>,
     pub guest_port: u16,
 }
 
@@ -456,6 +459,22 @@ impl Net {
                 proto.as_str()
             );
         }
+        let v6_fwd = self.v6 == V6Mode::Snat;
+        if v6_fwd {
+            for proto in [L4Proto::Tcp, L4Proto::Udp] {
+                let elems = elements(forwards.iter().filter(|f| f.proto == proto).filter_map(
+                    |f| {
+                        f.target6
+                            .map(|t| format!("{} : {t} . {}", f.host_port, f.guest_port))
+                    },
+                ));
+                let _ = writeln!(
+                    r,
+                    "  map fwd6_{} {{ type inet_service : ipv6_addr . inet_service;{elems} }}",
+                    proto.as_str()
+                );
+            }
+        }
         let _ = writeln!(
             r,
             "  chain dstnat {{\n    type nat hook prerouting priority dstnat; policy accept;"
@@ -468,6 +487,16 @@ impl Net {
             r,
             "    fib daddr type local dnat ip to udp dport map @fwd_udp"
         );
+        if v6_fwd {
+            let _ = writeln!(
+                r,
+                "    fib daddr type local dnat ip6 to tcp dport map @fwd6_tcp"
+            );
+            let _ = writeln!(
+                r,
+                "    fib daddr type local dnat ip6 to udp dport map @fwd6_udp"
+            );
+        }
         let _ = writeln!(r, "  }}");
         // Connections made by the host itself to its own public address.
         let _ = writeln!(
@@ -482,6 +511,16 @@ impl Net {
             r,
             "    fib daddr type local dnat ip to udp dport map @fwd_udp"
         );
+        if v6_fwd {
+            let _ = writeln!(
+                r,
+                "    fib daddr type local dnat ip6 to tcp dport map @fwd6_tcp"
+            );
+            let _ = writeln!(
+                r,
+                "    fib daddr type local dnat ip6 to udp dport map @fwd6_udp"
+            );
+        }
         let _ = writeln!(r, "  }}");
         let _ = writeln!(
             r,
@@ -497,6 +536,10 @@ impl Net {
             let _ = writeln!(
                 r,
                 "    ip6 saddr {SNAT6_PREFIX}/64 ip6 daddr != {SNAT6_PREFIX}/64 masquerade"
+            );
+            let _ = writeln!(
+                r,
+                "    ip6 saddr {SNAT6_PREFIX}/64 ip6 daddr {SNAT6_PREFIX}/64 ct status dnat masquerade"
             );
         }
         let _ = writeln!(r, "  }}");
@@ -730,6 +773,7 @@ mod tests {
             proto: L4Proto::Tcp,
             host_port: 22022,
             target: inst[0].addrs.ipv4,
+            target6: inst[0].addrs.ipv6,
             guest_port: 22,
         }];
         let r = n.ruleset(&inst, &fw);
@@ -738,6 +782,17 @@ mod tests {
         assert!(r.contains("\"rv0\" . fd91:cafe:cafe:10::2"));
         assert!(r.contains("\"rv0\" . 203.0.113.9"), "{r}");
         assert!(r.contains("map fwd_udp { type inet_service : ipv4_addr . inet_service; }"));
+        assert!(
+            r.contains("elements = { 22022 : fd91:cafe:cafe:10::2 . 22 }"),
+            "{r}"
+        );
+        assert!(r.contains("map fwd6_udp { type inet_service : ipv6_addr . inet_service; }"));
+        assert_eq!(r.matches("dnat ip6 to tcp dport map @fwd6_tcp").count(), 2);
+
+        // subnet mode: instances are routed directly, no IPv6 DNAT.
+        let n = Net::from_config(&cfg("subnet", "2001:db8:1:2::/64")).unwrap();
+        let r = n.ruleset(&inst, &fw);
+        assert!(!r.contains("fwd6_"), "{r}");
     }
 
     #[test]

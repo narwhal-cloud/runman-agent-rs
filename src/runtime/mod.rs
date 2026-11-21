@@ -450,6 +450,7 @@ impl Runtime {
                     proto: f.proto,
                     host_port: f.host_port,
                     target: r.addrs.ipv4,
+                    target6: r.addrs.ipv6,
                     guest_port: f.guest_port,
                 })
             })
