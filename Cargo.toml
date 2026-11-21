@@ -23,7 +23,7 @@ async-trait = "0.1.92"
 clap = { version = "4.6.9", features = ["derive"] }
 libc = "0.2.191"
 nix = { version = "0.32.0", features = ["fs", "hostname", "ioctl", "mount", "poll", "process", "sched", "signal", "term", "user"] }
-sha-crypt = { version = "0.6.0", features = ["getrandom"] }
+sha-crypt = "0.6.0"
 sha2 = "0.11.1"
 prost = "0.14.6"
 rand = "0.10.4"

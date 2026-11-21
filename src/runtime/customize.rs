@@ -334,9 +334,19 @@ fn hosts(hostname: &str) -> String {
 }
 
 pub fn hash_password(password: &str) -> Result<String> {
-    // SHA-512 crypt, 5000 rounds: `$6$rounds=5000$<salt>$<hash>`.
+    hash_password_with_salt(password, &rand::random())
+}
+
+/// SHA-512 crypt, 5000 rounds: `$6$rounds=5000$<salt>$<hash>`.
+///
+/// The salt is 12 bytes so it encodes to exactly 16 characters, the most
+/// SHA-crypt allows. sha-crypt's own `hash_password` uses 16 bytes (22
+/// characters) and only hashes the first 16, which glibc/musl `crypt` reject:
+/// they truncate the salt and the result no longer matches the stored string,
+/// so the password would never log in.
+fn hash_password_with_salt(password: &str, salt: &[u8; 12]) -> Result<String> {
     let hash = ShaCrypt::SHA512
-        .hash_password(password.as_bytes())
+        .hash_password_with_salt(password.as_bytes(), salt)
         .map_err(|e| anyhow::anyhow!("hash password: {e:?}"))?;
     Ok(hash.to_string())
 }
@@ -400,19 +410,24 @@ mod tests {
 
     #[test]
     fn hash_verifies() {
-        let h = hash_password("Secret-pass1").unwrap();
-        assert!(h.starts_with("$6$"));
         use sha_crypt::PasswordVerifier;
+        let h = hash_password("Secret-pass1").unwrap();
+        let salt = h.split('$').nth(3).unwrap();
         assert!(h.starts_with("$6$rounds=5000$"), "{h}");
-        assert!(
-            ShaCrypt::SHA512
-                .verify_password(b"Secret-pass1", h.as_str())
-                .is_ok()
-        );
-        assert!(
-            ShaCrypt::SHA512
-                .verify_password(b"wrong", h.as_str())
-                .is_err()
+        assert_eq!(salt.len(), 16, "{h}");
+        let verify = |pw: &[u8]| ShaCrypt::SHA512.verify_password(pw, h.as_str()).is_ok();
+        assert!(verify(b"Secret-pass1"));
+        assert!(!verify(b"wrong"));
+    }
+
+    #[test]
+    fn hash_matches_glibc_crypt() {
+        // Expected value from glibc:
+        // perl -e 'print crypt(q(Secret-pass1), q($6$rounds=5000$mJbPh3aPhALMgFL6$))'
+        let h = hash_password_with_salt("Secret-pass1", b"runman-salt!").unwrap();
+        assert_eq!(
+            h,
+            "$6$rounds=5000$mJbPh3aPhALMgFL6$Ji/Fa851cMu2JvKkX1GLnHl/bDqle9OZ16wDoK4ZLFM2msU8ZW5AbSDXEff.3BqxVjVwUSTiQVAwz/anCITSX0"
         );
     }
 }
