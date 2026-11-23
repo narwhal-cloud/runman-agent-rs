@@ -79,8 +79,8 @@ pub struct Forward {
     pub proto: L4Proto,
     pub host_port: u16,
     pub target: Ipv4Addr,
-    /// The instance's IPv6 address; forwarded from the host's IPv6 in snat
-    /// mode (in subnet mode instances are reachable directly).
+    /// The instance's IPv6 address; published ports are forwarded to it from
+    /// the host's IPv6 (in subnet mode the address is also public).
     pub target6: Option<Ipv6Addr>,
     pub guest_port: u16,
 }
@@ -459,7 +459,10 @@ impl Net {
                 proto.as_str()
             );
         }
-        let v6_fwd = self.v6 == V6Mode::Snat;
+        // Published ports are also reachable through the host's own IPv6
+        // (the main entry address). In subnet mode instances additionally
+        // keep their public address, reachable directly.
+        let v6_fwd = self.v6 != V6Mode::None;
         if v6_fwd {
             for proto in [L4Proto::Tcp, L4Proto::Udp] {
                 let elems = elements(forwards.iter().filter(|f| f.proto == proto).filter_map(
@@ -540,6 +543,14 @@ impl Net {
             let _ = writeln!(
                 r,
                 "    ip6 saddr {SNAT6_PREFIX}/64 ip6 daddr {SNAT6_PREFIX}/64 ct status dnat masquerade"
+            );
+        } else if v6_fwd {
+            // Hairpin in subnet mode: an instance reaching a forward via the
+            // host's IPv6 (possibly to itself) must get the reply back
+            // through the host.
+            let _ = writeln!(
+                r,
+                "    meta nfproto ipv6 iifname \"{br}\" oifname \"{br}\" ct status dnat masquerade"
             );
         }
         let _ = writeln!(r, "  }}");
@@ -789,8 +800,34 @@ mod tests {
         assert!(r.contains("map fwd6_udp { type inet_service : ipv6_addr . inet_service; }"));
         assert_eq!(r.matches("dnat ip6 to tcp dport map @fwd6_tcp").count(), 2);
 
-        // subnet mode: instances are routed directly, no IPv6 DNAT.
+        // subnet mode: instances keep their public address, and published
+        // ports are also forwarded from the host's IPv6.
         let n = Net::from_config(&cfg("subnet", "2001:db8:1:2::/64")).unwrap();
+        let inst = vec![Port {
+            idx: 0,
+            addrs: n.addrs_for(0).unwrap(),
+            extra: vec![],
+        }];
+        let fw = vec![Forward {
+            proto: L4Proto::Tcp,
+            host_port: 22022,
+            target: inst[0].addrs.ipv4,
+            target6: inst[0].addrs.ipv6,
+            guest_port: 22,
+        }];
+        let r = n.ruleset(&inst, &fw);
+        assert!(
+            r.contains("elements = { 22022 : 2001:db8:1:2::1:0 . 22 }"),
+            "{r}"
+        );
+        assert_eq!(r.matches("dnat ip6 to tcp dport map @fwd6_tcp").count(), 2);
+        assert!(
+            r.contains("iifname \"rmbr0\" oifname \"rmbr0\" ct status dnat masquerade"),
+            "{r}"
+        );
+
+        // none mode: no IPv6 forwards.
+        let n = Net::from_config(&cfg("none", "")).unwrap();
         let r = n.ruleset(&inst, &fw);
         assert!(!r.contains("fwd6_"), "{r}");
     }
