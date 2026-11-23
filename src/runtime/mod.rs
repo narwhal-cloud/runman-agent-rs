@@ -672,12 +672,14 @@ impl Runtime {
     }
 
     /// Repair host state that something else removed: re-apply the nftables
-    /// ruleset (atomic, so harmless when nothing changed) and re-plug running
+    /// ruleset (atomic, so harmless when nothing changed), IPv6 sysctls and
+    /// gateway addresses (`Net::heal_v6`), and re-plug running
     /// instances whose veth vanished (`ip link del`, network restarts).
     pub async fn heal(&self) {
         if let Err(e) = self.reconcile_network().await {
             warn!("re-apply network rules: {e:#}");
         }
+        self.net.heal_v6().await;
         let Ok(records) = self.records() else { return };
         for rec in &records {
             let rs = self.run_spec(rec);

@@ -57,6 +57,10 @@ pub struct Net {
     v4_len: u8,
     pub v6: V6Mode,
     pub dns: Vec<String>,
+    /// Set once `enable_v6` ran (always in snat/subnet mode; in `none` mode
+    /// only after an instance got a dedicated IPv6). `heal_v6` keeps the
+    /// state it set up from then on.
+    v6_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Addresses assigned to one instance.
@@ -140,6 +144,7 @@ impl Net {
             v4_len,
             v6,
             dns: c.dns.clone(),
+            v6_enabled: Default::default(),
         })
     }
 
@@ -230,7 +235,65 @@ impl Net {
         {
             sysctl(&format!("net.ipv6.conf.{up}.proxy_ndp"), "1").await?;
         }
-        sysctl("net.ipv6.conf.all.forwarding", "1").await
+        sysctl("net.ipv6.conf.all.forwarding", "1").await?;
+        self.v6_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Restore IPv6 host state that something else reset after `enable_v6`
+    /// (`netplan apply`, networkd reconfiguring a link, `sysctl --system`,
+    /// a recreated uplink). Without it, instance IPv6 stops working silently:
+    /// `proxy_ndp=0` once the upstream router's neighbor entries expire,
+    /// `accept_ra=1` with forwarding on once the host's RA-learned default
+    /// route expires (often 30 min later). Only touches what differs, and
+    /// logs each repair.
+    pub async fn heal_v6(&self) {
+        if !self.v6_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let br = self.bridge.as_str();
+        let mut want = vec![(format!("net.ipv6.conf.{br}.disable_ipv6"), "0")];
+        // accept_ra before forwarding, as in `enable_v6`.
+        for iface in ra_interfaces() {
+            want.push((format!("net.ipv6.conf.{iface}.accept_ra"), "2"));
+        }
+        if let V6Mode::Subnet {
+            ndp_uplink: Some(up),
+            ..
+        } = &self.v6
+        {
+            want.push((format!("net.ipv6.conf.{up}.proxy_ndp"), "1"));
+        }
+        want.push(("net.ipv6.conf.all.forwarding".into(), "1"));
+        for (key, value) in &want {
+            let path = std::path::Path::new("/proc/sys").join(key.replace('.', "/"));
+            let Ok(cur) = tokio::fs::read_to_string(&path).await else {
+                continue; // interface gone
+            };
+            if cur.trim() == *value {
+                continue;
+            }
+            match sysctl(key, value).await {
+                Ok(()) => tracing::warn!("ipv6: {key} was {}, restored {value}", cur.trim()),
+                Err(e) => tracing::warn!("ipv6: restore {key}: {e:#}"),
+            }
+        }
+        let mut addrs = vec![(GATEWAY6_LL, 64)];
+        if self.v6 == V6Mode::Snat {
+            addrs.push((Ipv6Addr::from(u128::from(SNAT6_PREFIX) + 1), 64));
+        }
+        let present = std::fs::read_to_string("/proc/net/if_inet6").unwrap_or_default();
+        for (addr, len) in addrs {
+            if has_addr(&present, br, addr) {
+                continue;
+            }
+            let a = format!("{addr}/{len}");
+            match run(Command::new("ip").args(["-6", "addr", "replace", &a, "dev", br])).await {
+                Ok(_) => tracing::warn!("ipv6: {a} was missing on {br}, restored"),
+                Err(e) => tracing::warn!("ipv6: restore {a} on {br}: {e:#}"),
+            }
+        }
     }
 
     /// Converge nftables, NDP proxy entries and IPv6 host routes.
@@ -679,6 +742,16 @@ fn host_route(dst: &str) -> Option<Ipv6Addr> {
     }
 }
 
+/// Is `addr` assigned to `ifname`, per `/proc/net/if_inet6`
+/// (`<32 hex addr> <ifindex> <plen> <scope> <flags> <ifname>`)?
+fn has_addr(if_inet6: &str, ifname: &str, addr: Ipv6Addr) -> bool {
+    let hex = format!("{:032x}", u128::from(addr));
+    if_inet6.lines().any(|l| {
+        let cols: Vec<&str> = l.split_whitespace().collect();
+        cols.first() == Some(&hex.as_str()) && cols.get(5) == Some(&ifname)
+    })
+}
+
 /// Interfaces that accept RAs only while not forwarding (`accept_ra = 1`).
 fn ra_interfaces() -> Vec<String> {
     let Ok(dir) = std::fs::read_dir("/proc/sys/net/ipv6/conf") else {
@@ -839,6 +912,26 @@ mod tests {
         assert_eq!(host_route("2001:db8::1:5/128"), Some(a));
         assert_eq!(host_route("fe80::/64"), None);
         assert_eq!(host_route("default"), None);
+    }
+
+    #[test]
+    fn if_inet6_lookup() {
+        let t = "fe800000000000000000000000000001 05 40 20 80    rmbr0\n\
+                 fd91cafecafe00100000000000000001 05 40 00 80    rmbr0\n\
+                 fe800000000000000000000000000001 02 40 20 80     eth0\n";
+        let ll = GATEWAY6_LL;
+        assert!(has_addr(t, "rmbr0", ll));
+        assert!(has_addr(
+            t,
+            "rmbr0",
+            "fd91:cafe:cafe:10::1".parse().unwrap()
+        ));
+        assert!(!has_addr(t, "rmbr1", ll));
+        assert!(!has_addr(
+            t,
+            "eth0",
+            "fd91:cafe:cafe:10::1".parse().unwrap()
+        ));
     }
 
     #[test]
